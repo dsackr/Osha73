@@ -1,0 +1,280 @@
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>E-Paper</title>
+<style>
+body{font-family:Arial;margin:0;background:#0f172a;color:#e5e7eb}
+.container{max-width:900px;margin:0 auto;padding:20px}
+h1{text-align:center;color:#f97316}
+.card{background:#111827;padding:20px;border-radius:10px;margin-bottom:16px}
+label{display:block;margin:10px 0 6px;font-weight:bold}
+input[type=file],input[type=text]{width:100%;padding:10px;border-radius:6px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
+button{padding:12px 18px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px}
+button:disabled{opacity:.6;cursor:not-allowed}
+.muted{color:#9ca3af;font-size:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.row button{flex:1}
+.small{color:#9ca3af;font-size:13px;line-height:1.4}
+</style></head><body>
+<div class="container">
+<h1>E-Paper</h1>
+
+<div class="card">
+  <p class="muted" id="status">Ready.</p>
+  <p class="muted" id="info">Loading status...</p>
+  <p class="muted" id="timer">Loading session timer...</p>
+  <div class="row" style="margin-top:10px">
+    <button id="extendBtn">+5 minutes</button>
+    <button id="shutdownBtn" style="background:#dc2626">Shutdown now</button>
+  </div>
+  <p class="small">STA mode auto-shutdown at timer end. AP mode stays on.</p>
+</div>
+
+<div class="card">
+  <label>Pull URL (Pi endpoint)</label>
+  <input type="text" id="pullUrl" placeholder="http://pi-zero.local:8080/latest.bin">
+  <div class="row" style="margin-top:12px">
+    <button id="savePullBtn">Save Pull URL</button>
+  </div>
+  <p class="small">On boot (STA mode), device will GET this once expecting 192000 raw bytes.</p>
+  
+  <label style="margin-top:20px">Auto-refresh interval (hours)</label>
+  <input type="number" id="sleepHours" min="1" max="168" value="24">
+  <div class="row" style="margin-top:12px">
+    <button id="saveSleepBtn">Save Interval</button>
+  </div>
+  <p class="small">Device will wake from deep sleep after this many hours to refresh the display (1-168 hours).</p>
+</div>
+
+<div class="card">
+  <label>Choose image (manual override)</label>
+  <input type="file" id="fileInput" accept="image/*">
+  <label>Optional name to save (SD)</label>
+  <input type="text" id="imageName" placeholder="Optional name to save (letters/numbers/_/-)">
+  <div class="row" style="margin-top:12px">
+    <button id="sendBtn">Convert + Upload (binary)</button>
+  </div>
+</div>
+
+<script>
+var statusEl=document.getElementById('status');
+var infoEl=document.getElementById('info');
+var timerEl=document.getElementById('timer');
+
+var extendBtn=document.getElementById('extendBtn');
+var shutdownBtn=document.getElementById('shutdownBtn');
+
+var pullUrlEl=document.getElementById('pullUrl');
+var savePullBtn=document.getElementById('savePullBtn');
+var sleepHoursEl=document.getElementById('sleepHours');
+var saveSleepBtn=document.getElementById('saveSleepBtn');
+
+var sendBtn=document.getElementById('sendBtn');
+
+function logStatus(m){statusEl.textContent=m;}
+function logInfo(m){infoEl.textContent=m;}
+
+var msLeft=0;
+var lastTick=Date.now();
+
+async function fetchStatus(){
+  try{
+    var res=await fetch('/status');
+    var d=await res.json();
+    logInfo('SSID: '+d.ssid+' | IP: '+d.ip+' | Battery: '+d.battery_percent+'% ('+d.battery_voltage+' V) | '+d.battery_state+' ('+d.battery_crate_pct_per_hr+' %/hr) | WiFiPS: '+d.wifi_powersave);
+    if(document.activeElement !== pullUrlEl){
+      pullUrlEl.value = d.pull_url || '';
+    }
+    if(document.activeElement !== sleepHoursEl){
+      sleepHoursEl.value = d.sleep_hours || 24;
+    }
+  }catch(e){
+    logInfo('Unable to load status');
+  }
+}
+
+async function fetchSession(){
+  try{
+    var res=await fetch('/session');
+    var d=await res.json();
+    msLeft = d.ms_left || 0;
+    lastTick = Date.now();
+  }catch(e){}
+}
+
+setInterval(function(){
+  var dt = Date.now() - lastTick;
+  var cur = Math.max(0, msLeft - dt);
+  var s = Math.floor(cur/1000);
+  var mm = Math.floor(s/60);
+  var ss = String(s%60).padStart(2,'0');
+  timerEl.textContent = 'Wi-Fi window: '+mm+':'+ss+' remaining';
+}, 250);
+
+setInterval(fetchStatus, 2000);
+setInterval(fetchSession, 2000);
+
+extendBtn.onclick = async function(){
+  await fetch('/extend?minutes=5', {method:'POST'});
+  await fetchSession();
+};
+
+shutdownBtn.onclick = async function(){
+  if(!confirm('Shutdown now (deep sleep forever)?')) return;
+  await fetch('/shutdown');
+};
+
+savePullBtn.onclick = async function(){
+  var url = pullUrlEl.value.trim();
+  if(!url){ alert('Enter a URL'); return; }
+  var res = await fetch('/pullurl', {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'url='+encodeURIComponent(url)
+  });
+  if(res.ok) alert('Saved'); else alert('Failed to save');
+  await fetchStatus();
+};
+
+saveSleepBtn.onclick = async function(){
+  var hours = parseInt(sleepHoursEl.value);
+  if(isNaN(hours) || hours < 1 || hours > 168){
+    alert('Hours must be between 1 and 168');
+    return;
+  }
+  var res = await fetch('/sleepconfig', {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'hours='+hours
+  });
+  if(res.ok) alert('Saved - will wake every '+hours+' hours'); else alert('Failed to save');
+  await fetchStatus();
+};
+
+var palette=[
+  {code:0x0,r:0,g:0,b:0},
+  {code:0x1,r:255,g:255,b:255},
+  {code:0x2,r:255,g:255,b:0},
+  {code:0x3,r:255,g:0,b:0},
+  {code:0x5,r:0,g:0,b:255},
+  {code:0x6,r:0,g:128,b:0},
+  {code:0x7,r:255,g:255,b:255}
+];
+
+function nearestPaletteColor(r,g,b){
+  var best=palette[0], bestDist=1e18;
+  for(var i=0;i<palette.length;i++){
+    var p=palette[i];
+    var dr=r-p.r,dg=g-p.g,db=b-p.b;
+    var dist=dr*dr+dg*dg+db*db;
+    if(dist<bestDist){bestDist=dist;best=p;}
+  }
+  return best;
+}
+function clamp(v){ return Math.max(0,Math.min(255,v)); }
+
+function applyFloydSteinberg(imgData){
+  var data=imgData.data, width=imgData.width, height=imgData.height;
+  for(var y=0;y<height;y++){
+    for(var x=0;x<width;x++){
+      var idx=(y*width+x)*4;
+      var oldR=data[idx], oldG=data[idx+1], oldB=data[idx+2];
+      var n=nearestPaletteColor(oldR,oldG,oldB);
+      data[idx]=n.r; data[idx+1]=n.g; data[idx+2]=n.b;
+      var errR=oldR-n.r, errG=oldG-n.g, errB=oldB-n.b;
+
+      function scatter(nx,ny,f){
+        if(nx<0||nx>=width||ny<0||ny>=height) return;
+        var j=(ny*width+nx)*4;
+        data[j]=clamp(data[j]+errR*f);
+        data[j+1]=clamp(data[j+1]+errG*f);
+        data[j+2]=clamp(data[j+2]+errB*f);
+      }
+      scatter(x+1,y,7/16);
+      scatter(x-1,y+1,3/16);
+      scatter(x,y+1,5/16);
+      scatter(x+1,y+1,1/16);
+    }
+  }
+}
+
+function packToEPD(imgData){
+  var packed=new Uint8Array(800*480/2);
+  var p=0;
+  for(var i=0;i<imgData.data.length;i+=8){
+    var n1=nearestPaletteColor(imgData.data[i],imgData.data[i+1],imgData.data[i+2]).code;
+    var n2=nearestPaletteColor(imgData.data[i+4],imgData.data[i+5],imgData.data[i+6]).code;
+    packed[p++]=(n1<<4)|n2;
+  }
+  return packed;
+}
+
+function cropFill(image){
+  var cw=800,ch=480;
+  var canvas=document.createElement('canvas');
+  canvas.width=cw; canvas.height=ch;
+  var ctx=canvas.getContext('2d');
+  ctx.imageSmoothingEnabled=true;
+  ctx.fillStyle='#ffffff';
+  ctx.fillRect(0,0,cw,ch);
+
+  var portrait=image.height>image.width;
+  if(portrait){
+    ctx.save();
+    ctx.translate(cw/2,ch/2);
+    ctx.rotate(-Math.PI/2);
+    var w=ch, h=cw;
+    var scale=Math.max(w/image.width, h/image.height);
+    var dw=image.width*scale;
+    var dh=image.height*scale;
+    ctx.drawImage(image, -dw/2, -dh/2, dw, dh);
+    ctx.restore();
+  }else{
+    var scale2=Math.max(cw/image.width, ch/image.height);
+    var dw2=image.width*scale2;
+    var dh2=image.height*scale2;
+    var dx=(cw-dw2)/2;
+    var dy=(ch-dh2)/2;
+    ctx.drawImage(image, dx, dy, dw2, dh2);
+  }
+
+  var imgData=ctx.getImageData(0,0,cw,ch);
+  applyFloydSteinberg(imgData);
+  return packToEPD(imgData);
+}
+
+async function uploadPackedBytes(bytes, saveName){
+  logStatus('Uploading...');
+  var fd = new FormData();
+  fd.append('file', new Blob([bytes], {type:'application/octet-stream'}), 'image.bin');
+  var query = saveName ? ('?save='+encodeURIComponent(saveName)) : '';
+  var res = await fetch('/display/upload'+query, { method:'POST', body: fd });
+  if(!res.ok){ logStatus('Upload failed'); return; }
+  var data = {};
+  try{ data = await res.json(); }catch(e){}
+  logStatus(data.message || 'Display updated');
+}
+
+sendBtn.onclick = async function(){
+  var file=document.getElementById('fileInput').files[0];
+  var saveName=document.getElementById('imageName').value.trim();
+  if(!file){ logStatus('Select a file first.'); return; }
+  sendBtn.disabled=true;
+  logStatus('Converting...');
+  var reader=new FileReader();
+  reader.onload=function(){
+    var img=new Image();
+    img.onload=async function(){
+      var bytes=cropFill(img);
+      await uploadPackedBytes(bytes, saveName);
+      sendBtn.disabled=false;
+    };
+    img.onerror=function(){ logStatus('Failed to load image.'); sendBtn.disabled=false; };
+    img.src=reader.result;
+  };
+  reader.readAsDataURL(file);
+};
+
+fetchStatus();
+fetchSession();
+</script>
+</div></body></html>
