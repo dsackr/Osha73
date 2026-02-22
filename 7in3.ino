@@ -183,6 +183,7 @@ void handleImagesUploadStream();
 void handleImagesUploadDone();
 void handleImagesList();
 void handleImagesThumb();
+void handleImagesRaw();
 void handleImagesDelete();
 void handleDisplayShow();
 void handleOshaRefresh();
@@ -1268,6 +1269,20 @@ void handleImagesThumb() {
   f.close();
 }
 
+void handleImagesRaw() {
+  if (!sdMounted) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+  if (!server.hasArg("name")) { server.send(400, "application/json", "{\"error\":\"missing name\"}"); return; }
+
+  String name = sanitizeGalleryFileName(server.arg("name"));
+  String path = "/gallery/" + name;
+  if (!SD.exists(path.c_str())) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+
+  File f = SD.open(path.c_str(), FILE_READ);
+  if (!f) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
 void handleImagesDelete() {
   if (!sdMounted || !server.hasArg("name")) { server.send(400, "application/json", "{\"error\":\"missing name\"}"); return; }
   String name = sanitizeGalleryFileName(server.arg("name"));
@@ -1397,6 +1412,7 @@ void setupWebServer() {
   server.on("/images/upload", HTTP_POST, handleImagesUploadDone, handleImagesUploadStream);
   server.on("/images/list", HTTP_GET, handleImagesList);
   server.on("/images/thumb", HTTP_GET, handleImagesThumb);
+  server.on("/images/raw", HTTP_GET, handleImagesRaw);
   server.on("/images/delete", HTTP_POST, handleImagesDelete);
   server.on("/display/show", HTTP_POST, handleDisplayShow);
   server.on("/osha/config", HTTP_POST, handleOshaConfig);
