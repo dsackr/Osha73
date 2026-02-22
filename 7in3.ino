@@ -21,11 +21,15 @@
 #include <DNSServer.h>
 #include <Wire.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <FS.h>
 #include <SD.h>
 #include <LittleFS.h>
 #include <esp_sleep.h>
 #include <ctype.h>
+#include <vector>
+#include <algorithm>
+#include <time.h>
 
 // ================= Pins =================
 #define BUSY_Pin  3
@@ -118,6 +122,47 @@ bool oshaEnabled = false;
 String oshaToken = "";
 String oshaBaseUrl = "https://api.incident.io/v2/incidents";
 
+int oshaDays = 0;
+int oshaPrior = 0;
+String oshaIncident = "";
+String oshaDate = "";
+String oshaReason = "";
+
+volatile bool pendingDisplayRefresh = false;
+
+struct OshaState {
+  int days;
+  int prior;
+  String incident;
+  String date;
+  String reason;
+};
+
+struct OshaLayout {
+  String backgroundPath;
+  int daysX;
+  int daysY;
+  int daysScale;
+  int priorX;
+  int priorY;
+  int priorScale;
+  int incidentX;
+  int incidentY;
+  int incidentScale;
+  int dateX;
+  int dateY;
+  int dateScale;
+  int deployBoxX;
+  int deployBoxY;
+  int changeBoxX;
+  int changeBoxY;
+  int missedBoxX;
+  int missedBoxY;
+  int boxSize;
+};
+
+OshaState currentOshaState = {0,0,"","",""};
+
 
 
 String pullUrl = "";
@@ -141,6 +186,10 @@ void handleImagesThumb();
 void handleImagesDelete();
 void handleDisplayShow();
 void handleOshaRefresh();
+void handleOshaConfig();
+bool refreshOshaAndMaybeDisplay(bool forceDisplay);
+bool renderOshaDisplay(const OshaState &state);
+void processPendingDisplayRefresh();
 
 void Epaper_Write_Data(unsigned char data);
 void Epaper_READBUSY(void);
@@ -165,6 +214,17 @@ String sanitizeFileName(const String &name);
 void maybeOpenSDForSave();
 bool fetchAndDisplayOneShot();
 void shutdownForever();
+void writeDisplayRefreshSequence();
+bool ensureOshaConfigJson();
+bool loadOshaLayout(OshaLayout &layout);
+bool loadOshaStateFromSd(OshaState &state);
+bool saveOshaStateToSd(const OshaState &state);
+bool fetchOshaState(OshaState &stateOut);
+String normalizeOshaCategory(const String &raw);
+bool parseIsoToEpoch(const String &iso, time_t &epochOut);
+String epochToNyDate(time_t utcEpoch);
+String nyTodayDate();
+int daysBetweenDates(const String &fromDate, const String &toDate);
 
 // Web handlers
 void handleRoot();
@@ -449,6 +509,19 @@ String sanitizeFileName(const String &name) {
   return clean;
 }
 
+String sanitizeGalleryFileName(const String &name) {
+  String clean = sanitizeFileName(name);
+  if (clean.length() == 0) clean = "image" + String(millis()) + ".bin";
+  return clean;
+}
+
+void ensureGalleryDir() {
+  if (!sdMounted) return;
+  if (!SD.exists("/gallery")) SD.mkdir("/gallery");
+  if (!SD.exists("/gallery/.thumbs")) SD.mkdir("/gallery/.thumbs");
+  if (!SD.exists("/osha")) SD.mkdir("/osha");
+}
+
 void maybeOpenSDForSave() {
   if (!sdMounted) return;
   if (!server.hasArg("save")) return;
@@ -469,6 +542,9 @@ void setupWiFi(void) {
   pullUrl  = preferences.getString("pullurl", "");
   wifiPowerSave = preferences.getBool("wps", true);
   sleepHours = preferences.getUInt("sleepHours", 24);
+  oshaEnabled = preferences.getBool("osha_enabled", false);
+  oshaToken = preferences.getString("osha_token", "");
+  oshaBaseUrl = preferences.getString("osha_url", "https://api.incident.io/v2/incidents");
   preferences.end();
 
   if (savedSSID.length() > 0) {
@@ -641,7 +717,13 @@ void handleStatus() {
   json += "\"pull_url\":\"" + pullUrl + "\",";
   json += "\"sleep_hours\":" + String(sleepHours) + ",";
   json += "\"ms_left\":" + String(msLeft) + ",";
-  json += "\"busy\":" + String(displayBusy ? "true" : "false");
+  json += "\"busy\":" + String(displayBusy ? "true" : "false") + ",";
+  json += "\"osha_enabled\":" + String(oshaEnabled ? "true" : "false") + ",";
+  json += "\"osha_days\":" + String(oshaDays) + ",";
+  json += "\"osha_prior\":" + String(oshaPrior) + ",";
+  json += "\"osha_incident\":\"" + oshaIncident + "\",";
+  json += "\"osha_date\":\"" + oshaDate + "\",";
+  json += "\"osha_reason\":\"" + oshaReason + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -756,17 +838,475 @@ void handleUploadDone() {
     imageBytesWritten++;
   }
 
+  if (currentImageFile) currentImageFile.close();
+
+  uploadInProgress = false;
+  pendingDisplayRefresh = true;
+
+  server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Upload complete, refreshing\"}");
+}
+
+void writeDisplayRefreshSequence() {
   Epaper_Write_Command(DRF);
   Epaper_Write_Data(0x00);
   Epaper_READBUSY();
   EPD_DeepSleep();
-
-  if (currentImageFile) currentImageFile.close();
-
-  uploadInProgress = false;
   displayBusy = false;
+}
 
-  server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Display updated\"}");
+void processPendingDisplayRefresh() {
+  if (!pendingDisplayRefresh) return;
+  pendingDisplayRefresh = false;
+  writeDisplayRefreshSequence();
+}
+
+// ================= OSHA helpers =================
+bool ensureOshaConfigJson() {
+  if (!sdMounted) return false;
+  if (SD.exists("/osha/config.json")) return true;
+
+  DynamicJsonDocument d(1024);
+  d["background_path"] = "/osha/background.bin";
+  d["days_x"] = 70; d["days_y"] = 120; d["days_scale"] = 10;
+  d["prior_x"] = 520; d["prior_y"] = 120; d["prior_scale"] = 4;
+  d["incident_x"] = 520; d["incident_y"] = 190; d["incident_scale"] = 4;
+  d["date_x"] = 520; d["date_y"] = 250; d["date_scale"] = 3;
+  d["deploy_box_x"] = 520; d["deploy_box_y"] = 320;
+  d["change_box_x"] = 520; d["change_box_y"] = 360;
+  d["missed_box_x"] = 520; d["missed_box_y"] = 400;
+  d["box_size"] = 18;
+
+  File f = SD.open("/osha/config.json", FILE_WRITE);
+  if (!f) return false;
+  serializeJsonPretty(d, f);
+  f.close();
+  return true;
+}
+
+bool loadOshaLayout(OshaLayout &layout) {
+  if (!ensureOshaConfigJson()) return false;
+  File f = SD.open("/osha/config.json", FILE_READ);
+  if (!f) return false;
+  DynamicJsonDocument d(2048);
+  if (deserializeJson(d, f)) { f.close(); return false; }
+  f.close();
+  layout.backgroundPath = d["background_path"] | "/osha/background.bin";
+  layout.daysX = d["days_x"] | 70; layout.daysY = d["days_y"] | 120; layout.daysScale = d["days_scale"] | 10;
+  layout.priorX = d["prior_x"] | 520; layout.priorY = d["prior_y"] | 120; layout.priorScale = d["prior_scale"] | 4;
+  layout.incidentX = d["incident_x"] | 520; layout.incidentY = d["incident_y"] | 190; layout.incidentScale = d["incident_scale"] | 4;
+  layout.dateX = d["date_x"] | 520; layout.dateY = d["date_y"] | 250; layout.dateScale = d["date_scale"] | 3;
+  layout.deployBoxX = d["deploy_box_x"] | 520; layout.deployBoxY = d["deploy_box_y"] | 320;
+  layout.changeBoxX = d["change_box_x"] | 520; layout.changeBoxY = d["change_box_y"] | 360;
+  layout.missedBoxX = d["missed_box_x"] | 520; layout.missedBoxY = d["missed_box_y"] | 400;
+  layout.boxSize = d["box_size"] | 18;
+  return true;
+}
+
+bool parseIsoToEpoch(const String &iso, time_t &epochOut) {
+  if (iso.length() < 19) return false;
+  struct tm t = {};
+  t.tm_year = iso.substring(0,4).toInt() - 1900;
+  t.tm_mon = iso.substring(5,7).toInt() - 1;
+  t.tm_mday = iso.substring(8,10).toInt();
+  t.tm_hour = iso.substring(11,13).toInt();
+  t.tm_min = iso.substring(14,16).toInt();
+  t.tm_sec = iso.substring(17,19).toInt();
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  time_t local = mktime(&t);
+  setenv("TZ", "EST5EDT", 1);
+  tzset();
+  int sign = 1, offH = 0, offM = 0;
+  if (iso.endsWith("Z")) sign = 0;
+  else {
+    int p = iso.lastIndexOf('+');
+    if (p < 0) p = iso.lastIndexOf('-');
+    if (p > 0 && p + 5 < (int)iso.length()) {
+      sign = (iso.charAt(p) == '+') ? 1 : -1;
+      offH = iso.substring(p+1,p+3).toInt();
+      offM = iso.substring(p+4,p+6).toInt();
+    }
+  }
+  long offSec = (sign == 0) ? 0 : sign * (offH * 3600 + offM * 60);
+  epochOut = local - offSec;
+  return true;
+}
+
+String epochToNyDate(time_t utcEpoch) {
+  struct tm tmny;
+  localtime_r(&utcEpoch, &tmny);
+  char buf[11];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &tmny);
+  return String(buf);
+}
+
+String nyTodayDate() {
+  time_t now = time(nullptr);
+  struct tm tmny;
+  localtime_r(&now, &tmny);
+  char buf[11];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &tmny);
+  return String(buf);
+}
+
+int daysBetweenDates(const String &fromDate, const String &toDate) {
+  if (fromDate.length() < 10 || toDate.length() < 10) return 0;
+  struct tm a = {};
+  a.tm_year = fromDate.substring(0,4).toInt() - 1900;
+  a.tm_mon = fromDate.substring(5,7).toInt() - 1;
+  a.tm_mday = fromDate.substring(8,10).toInt();
+  a.tm_hour = 12;
+  struct tm b = {};
+  b.tm_year = toDate.substring(0,4).toInt() - 1900;
+  b.tm_mon = toDate.substring(5,7).toInt() - 1;
+  b.tm_mday = toDate.substring(8,10).toInt();
+  b.tm_hour = 12;
+  time_t ta = mktime(&a);
+  time_t tb = mktime(&b);
+  if (ta <= 0 || tb <= 0) return 0;
+  return max(0, (int)((tb - ta) / 86400));
+}
+
+String normalizeOshaCategory(const String &rawIn) {
+  String raw = rawIn;
+  raw.toLowerCase();
+  if (raw.indexOf("deploy") >= 0) return "Deploy";
+  if (raw.indexOf("change") >= 0) return "Change";
+  if (raw.indexOf("miss") >= 0) return "Missed Task";
+  return "";
+}
+
+bool loadOshaStateFromSd(OshaState &state) {
+  if (!sdMounted || !SD.exists("/osha/state.json")) return false;
+  File f = SD.open("/osha/state.json", FILE_READ);
+  if (!f) return false;
+  DynamicJsonDocument d(512);
+  if (deserializeJson(d, f)) { f.close(); return false; }
+  f.close();
+  state.days = d["days"] | 0;
+  state.prior = d["prior"] | 0;
+  state.incident = String((const char*)(d["incident"] | ""));
+  state.date = String((const char*)(d["date"] | ""));
+  state.reason = String((const char*)(d["reason"] | ""));
+  return true;
+}
+
+bool saveOshaStateToSd(const OshaState &state) {
+  if (!sdMounted) return false;
+  File f = SD.open("/osha/state.json", FILE_WRITE);
+  if (!f) return false;
+  DynamicJsonDocument d(512);
+  d["days"] = state.days; d["prior"] = state.prior; d["incident"] = state.incident;
+  d["date"] = state.date; d["reason"] = state.reason;
+  serializeJson(d, f);
+  f.close();
+  return true;
+}
+
+bool fetchOshaState(OshaState &stateOut) {
+  if (!oshaEnabled || oshaToken.length() == 0 || WiFi.status() != WL_CONNECTED) return false;
+  std::vector<std::pair<time_t, String>> offenses;
+  String cursor = "";
+
+  while (true) {
+    String url = oshaBaseUrl;
+    if (cursor.length() > 0) url += "?cursor=" + cursor;
+
+    HTTPClient http;
+    http.setTimeout(12000);
+    if (!http.begin(url)) return false;
+    http.addHeader("Authorization", "Bearer " + oshaToken);
+    http.addHeader("Accept", "application/json");
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+    DynamicJsonDocument d(24576);
+    auto err = deserializeJson(d, http.getString());
+    http.end();
+    if (err) return false;
+
+    JsonArray incidents = d["incidents"].as<JsonArray>();
+    for (JsonVariant iv : incidents) {
+      String classification = "";
+      JsonArray entries = iv["custom_field_entries"].as<JsonArray>();
+      for (JsonVariant ev : entries) {
+        String fieldName = String((const char*)(ev["custom_field"]["name"] | ""));
+        String lower = fieldName; lower.toLowerCase();
+        if (lower == "rca classification") {
+          classification = String((const char*)(ev["value_catalog_entry"]["label"] | ev["value"]["label"] | ev["value"] | ""));
+          break;
+        }
+      }
+      String cat = normalizeOshaCategory(classification);
+      String cl = classification; cl.toLowerCase();
+      if (cl == "non-procedural incident" || cl == "not classified" || cat.length() == 0) continue;
+
+      String dateIso = String((const char*)(iv["incident_date"] | ""));
+      time_t ep = 0;
+      if (!parseIsoToEpoch(dateIso, ep)) continue;
+      offenses.push_back({ep, cat + "|" + String((const char*)(iv["id"] | ""))});
+    }
+
+    String nextCursor = String((const char*)(d["pagination"]["next_cursor"] | d["next_cursor"] | ""));
+    if (nextCursor.length() == 0) break;
+    cursor = nextCursor;
+  }
+
+  if (offenses.empty()) {
+    stateOut = {0,0,"","",""};
+    return true;
+  }
+
+  std::sort(offenses.begin(), offenses.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+
+  std::vector<String> uniqueDates;
+  time_t latestEp = 0;
+  String latestCat = "";
+  String latestId = "";
+
+  for (auto &off : offenses) {
+    String nyDate = epochToNyDate(off.first);
+    bool seen = false;
+    for (auto &d : uniqueDates) if (d == nyDate) { seen = true; break; }
+    if (seen) continue;
+    uniqueDates.push_back(nyDate);
+    int sep = off.second.indexOf('|');
+    String cat = off.second.substring(0, sep);
+    String iid = off.second.substring(sep + 1);
+    if (uniqueDates.size() == 1) {
+      latestEp = off.first;
+      latestCat = cat;
+      latestId = iid;
+    }
+  }
+
+  String latestDate = epochToNyDate(latestEp);
+  String todayDate = nyTodayDate();
+
+  String digits = "";
+  for (size_t i = 0; i < latestId.length(); i++) if (isdigit(latestId[i])) digits += latestId[i];
+
+  stateOut.days = daysBetweenDates(latestDate, todayDate);
+  stateOut.prior = (int)uniqueDates.size() - 1;
+  stateOut.incident = digits;
+  stateOut.date = latestDate;
+  stateOut.reason = latestCat;
+  return true;
+}
+
+bool renderOshaDisplay(const OshaState &state) {
+  if (!sdMounted) return false;
+  OshaLayout layout;
+  if (!loadOshaLayout(layout)) return false;
+  File bg = SD.open(layout.backgroundPath.c_str(), FILE_READ);
+  if (!bg) return false;
+
+  auto textPixel = [&](int x, int y, int tx, int ty, const String &txt, int scale)->bool {
+    int charW = 6 * scale;
+    int charH = 8 * scale;
+    int rx = x - tx, ry = y - ty;
+    if (rx < 0 || ry < 0) return false;
+    int idx = rx / charW;
+    if (idx < 0 || idx >= (int)txt.length()) return false;
+    int cx = (rx % charW) / scale;
+    int cy = (ry % charH) / scale;
+    if (cx >= 5 || cy >= 7) return false;
+    int fi = getCharIndex(txt[idx]);
+    uint8_t col = pgm_read_byte(&font5x7[fi][cx]);
+    return (col & (1 << cy));
+  };
+
+  auto boxPixel = [&](int x, int y, int bx, int by, bool tick)->bool {
+    int s = layout.boxSize;
+    int rx = x - bx, ry = y - by;
+    if (rx < 0 || ry < 0 || rx >= s || ry >= s) return false;
+    if (rx == 0 || ry == 0 || rx == s-1 || ry == s-1) return true;
+    if (tick && ((rx == ry) || (rx == ry-1) || (rx == ry+1))) return true;
+    return false;
+  };
+
+  EPD_Init();
+  Epaper_Write_Command(DTM);
+
+  size_t written = 0;
+  while (written < EPD_BUFFER_SIZE) {
+    int b = bg.read();
+    if (b < 0) b = 0x11;
+    int y = written / BYTES_PER_ROW;
+    int xb = written % BYTES_PER_ROW;
+    int x1 = xb * 2, x2 = x1 + 1;
+
+    uint8_t hi = (b >> 4) & 0x0F;
+    uint8_t lo = b & 0x0F;
+
+    String daysTxt = String(state.days);
+    if (textPixel(x1,y,layout.daysX,layout.daysY,daysTxt,layout.daysScale)) hi = EPD_7IN3F_BLACK;
+    if (textPixel(x2,y,layout.daysX,layout.daysY,daysTxt,layout.daysScale)) lo = EPD_7IN3F_BLACK;
+    if (textPixel(x1,y,layout.priorX,layout.priorY,String(state.prior),layout.priorScale)) hi = EPD_7IN3F_BLACK;
+    if (textPixel(x2,y,layout.priorX,layout.priorY,String(state.prior),layout.priorScale)) lo = EPD_7IN3F_BLACK;
+    if (textPixel(x1,y,layout.incidentX,layout.incidentY,state.incident,layout.incidentScale)) hi = EPD_7IN3F_BLACK;
+    if (textPixel(x2,y,layout.incidentX,layout.incidentY,state.incident,layout.incidentScale)) lo = EPD_7IN3F_BLACK;
+    if (textPixel(x1,y,layout.dateX,layout.dateY,state.date,layout.dateScale)) hi = EPD_7IN3F_BLACK;
+    if (textPixel(x2,y,layout.dateX,layout.dateY,state.date,layout.dateScale)) lo = EPD_7IN3F_BLACK;
+
+    bool dep = state.reason == "Deploy";
+    bool chg = state.reason == "Change";
+    bool mis = state.reason == "Missed Task";
+    if (boxPixel(x1,y,layout.deployBoxX,layout.deployBoxY,dep)) hi = EPD_7IN3F_BLACK;
+    if (boxPixel(x2,y,layout.deployBoxX,layout.deployBoxY,dep)) lo = EPD_7IN3F_BLACK;
+    if (boxPixel(x1,y,layout.changeBoxX,layout.changeBoxY,chg)) hi = EPD_7IN3F_BLACK;
+    if (boxPixel(x2,y,layout.changeBoxX,layout.changeBoxY,chg)) lo = EPD_7IN3F_BLACK;
+    if (boxPixel(x1,y,layout.missedBoxX,layout.missedBoxY,mis)) hi = EPD_7IN3F_BLACK;
+    if (boxPixel(x2,y,layout.missedBoxX,layout.missedBoxY,mis)) lo = EPD_7IN3F_BLACK;
+
+    hi = applyLowBatteryOverlayNibble(x1,y,hi);
+    lo = applyLowBatteryOverlayNibble(x2,y,lo);
+
+    Epaper_Write_Data((hi << 4) | lo);
+    written++;
+  }
+  bg.close();
+  Epaper_Write_Command(DRF);
+  Epaper_Write_Data(0x00);
+  Epaper_READBUSY();
+  EPD_DeepSleep();
+  return true;
+}
+
+bool refreshOshaAndMaybeDisplay(bool forceDisplay) {
+  OshaState fetched;
+  if (!fetchOshaState(fetched)) return false;
+
+  OshaState old = {0,0,"","",""};
+  bool hasOld = loadOshaStateFromSd(old);
+  bool changed = !hasOld || old.days != fetched.days || old.prior != fetched.prior || old.incident != fetched.incident || old.date != fetched.date || old.reason != fetched.reason;
+  if (forceDisplay || changed) {
+    if (!renderOshaDisplay(fetched)) return false;
+    saveOshaStateToSd(fetched);
+  }
+
+  currentOshaState = fetched;
+  oshaDays = fetched.days;
+  oshaPrior = fetched.prior;
+  oshaIncident = fetched.incident;
+  oshaDate = fetched.date;
+  oshaReason = fetched.reason;
+  return true;
+}
+
+void handleOshaConfig() {
+  int enabled = server.hasArg("enabled") ? server.arg("enabled").toInt() : (oshaEnabled ? 1 : 0);
+  oshaEnabled = enabled == 1;
+  preferences.begin("epaper", false);
+  preferences.putBool("osha_enabled", oshaEnabled);
+  if (server.hasArg("token") && server.arg("token").length() > 0) {
+    oshaToken = server.arg("token");
+    preferences.putString("osha_token", oshaToken);
+  }
+  preferences.putString("osha_url", oshaBaseUrl);
+  preferences.end();
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleOshaRefresh() {
+  if (!oshaEnabled) { server.send(400, "application/json", "{\"error\":\"osha disabled\"}"); return; }
+  bool ok = refreshOshaAndMaybeDisplay(true);
+  if (!ok) { server.send(500, "application/json", "{\"error\":\"refresh failed\"}"); return; }
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleImagesUploadStream() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    if (!sdMounted) return;
+    galleryBytesWritten = 0;
+    galleryFileName = sanitizeGalleryFileName(server.hasArg("name") ? server.arg("name") : "");
+    if (galleryFile) galleryFile.close();
+    galleryFile = SD.open(("/gallery/" + galleryFileName).c_str(), FILE_WRITE);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!galleryFile) return;
+    for (size_t i = 0; i < up.currentSize && galleryBytesWritten < EPD_BUFFER_SIZE; i++) {
+      galleryFile.write(up.buf[i]);
+      galleryBytesWritten++;
+    }
+  } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+    if (galleryFile) galleryFile.close();
+  }
+}
+
+void handleImagesUploadDone() {
+  if (!sdMounted) { server.send(500, "application/json", "{\"error\":\"sd unavailable\"}"); return; }
+  if (galleryBytesWritten != EPD_BUFFER_SIZE) { server.send(400, "application/json", "{\"error\":\"invalid size\"}"); return; }
+  String json = String("{\"status\":\"ok\",\"name\":\"") + galleryFileName + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void handleImagesList() {
+  if (!sdMounted) { server.send(200, "application/json", "[]"); return; }
+  File dir = SD.open("/gallery");
+  DynamicJsonDocument d(4096);
+  JsonArray arr = d.to<JsonArray>();
+  while (true) {
+    File f = dir.openNextFile();
+    if (!f) break;
+    String n = String(f.name());
+    if (!f.isDirectory() && n.endsWith(".bin")) arr.add(n.substring(n.lastIndexOf('/') + 1));
+    f.close();
+  }
+  String out; serializeJson(arr, out);
+  server.send(200, "application/json", out);
+}
+
+void handleImagesThumb() {
+  if (!sdMounted || !server.hasArg("name")) { server.send(400, "text/plain", "missing name"); return; }
+  String name = sanitizeGalleryFileName(server.arg("name"));
+  name.replace(".bin", ".jpg");
+  String p = "/gallery/.thumbs/" + name;
+  if (!SD.exists(p.c_str())) { server.send(404, "text/plain", "not found"); return; }
+  File f = SD.open(p.c_str(), FILE_READ);
+  server.streamFile(f, "image/jpeg");
+  f.close();
+}
+
+void handleImagesDelete() {
+  if (!sdMounted || !server.hasArg("name")) { server.send(400, "application/json", "{\"error\":\"missing name\"}"); return; }
+  String name = sanitizeGalleryFileName(server.arg("name"));
+  String p = "/gallery/" + name;
+  String t = "/gallery/.thumbs/" + name;
+  t.replace(".bin", ".jpg");
+  if (SD.exists(p.c_str())) SD.remove(p.c_str());
+  if (SD.exists(t.c_str())) SD.remove(t.c_str());
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleDisplayShow() {
+  if (!sdMounted || !server.hasArg("name")) { server.send(400, "application/json", "{\"error\":\"missing name\"}"); return; }
+  String name = sanitizeGalleryFileName(server.arg("name"));
+  File f = SD.open(("/gallery/" + name).c_str(), FILE_READ);
+  if (!f) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+
+  displayBusy = true;
+  EPD_Init();
+  Epaper_Write_Command(DTM);
+  size_t written = 0;
+  while (written < EPD_BUFFER_SIZE) {
+    int b = f.read();
+    if (b < 0) b = 0x11;
+    int y = written / BYTES_PER_ROW;
+    int xb = written % BYTES_PER_ROW;
+    int x1 = xb * 2, x2 = x1 + 1;
+    uint8_t hi = applyLowBatteryOverlayNibble(x1, y, (b >> 4) & 0x0F);
+    uint8_t lo = applyLowBatteryOverlayNibble(x2, y, b & 0x0F);
+    Epaper_Write_Data((hi << 4) | lo);
+    written++;
+  }
+  f.close();
+  Epaper_Write_Command(DRF);
+  Epaper_Write_Data(0x00);
+  Epaper_READBUSY();
+  EPD_DeepSleep();
+  displayBusy = false;
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 // ================= One-shot pull =================
@@ -854,6 +1394,13 @@ void setupWebServer() {
   server.on("/sleepconfig", HTTP_POST, handleSleepConfig);
   server.on("/shutdown", HTTP_GET, handleShutdown);
   server.on("/display/upload", HTTP_POST, handleUploadDone, handleUploadStream);
+  server.on("/images/upload", HTTP_POST, handleImagesUploadDone, handleImagesUploadStream);
+  server.on("/images/list", HTTP_GET, handleImagesList);
+  server.on("/images/thumb", HTTP_GET, handleImagesThumb);
+  server.on("/images/delete", HTTP_POST, handleImagesDelete);
+  server.on("/display/show", HTTP_POST, handleDisplayShow);
+  server.on("/osha/config", HTTP_POST, handleOshaConfig);
+  server.on("/osha/refresh", HTTP_POST, handleOshaRefresh);
 
   server.onNotFound([]() {
     server.sendHeader("Location", "/", true);
@@ -904,6 +1451,11 @@ void setup() {
   }
 
   sdMounted = (SD_CS_PIN >= 0) ? SD.begin(SD_CS_PIN) : SD.begin();
+  setenv("TZ", "EST5EDT", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  if (sdMounted) ensureGalleryDir();
+  if (sdMounted) (void)ensureOshaConfigJson();
 
   pinMode(NEOPIXEL_PIN, OUTPUT);
   digitalWrite(NEOPIXEL_PIN, LOW);
@@ -933,6 +1485,7 @@ void setup() {
 
   if (!isAPMode) {
     delay(ONE_SHOT_DELAY_MS);
+    if (oshaEnabled) (void)refreshOshaAndMaybeDisplay(false);
     (void)fetchAndDisplayOneShot();
   }
 }
@@ -946,8 +1499,9 @@ void loop() {
   }
 
   server.handleClient();
+  processPendingDisplayRefresh();
 
-  if (!displayBusy && !uploadInProgress) {
+  if (!displayBusy && !uploadInProgress && !pendingDisplayRefresh) {
     int32_t msLeft = (int32_t)(sessionEndMs - millis());
     if (msLeft <= 0) shutdownForever();
   }
