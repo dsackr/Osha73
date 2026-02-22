@@ -1,4 +1,6 @@
-<!DOCTYPE html><html><head>
+<!DOCTYPE html>
+<html>
+<head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>E-Paper</title>
 <style>
@@ -7,14 +9,17 @@ body{font-family:Arial;margin:0;background:#0f172a;color:#e5e7eb}
 h1{text-align:center;color:#f97316}
 .card{background:#111827;padding:20px;border-radius:10px;margin-bottom:16px}
 label{display:block;margin:10px 0 6px;font-weight:bold}
-input[type=file],input[type=text]{width:100%;padding:10px;border-radius:6px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
+input[type=file],input[type=text],input[type=password],input[type=number]{width:100%;padding:10px;border-radius:6px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
 button{padding:12px 18px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px}
 button:disabled{opacity:.6;cursor:not-allowed}
-.muted{color:#9ca3af;font-size:14px}
 .row{display:flex;gap:10px;flex-wrap:wrap}
 .row button{flex:1}
 .small{color:#9ca3af;font-size:13px;line-height:1.4}
-</style></head><body>
+.gallery-item{margin-bottom:10px;width:100px;text-align:center}
+.gallery-item img{width:100px;height:auto;display:block;margin-bottom:4px;border-radius:4px;border:1px solid #1f2937}
+</style>
+</head>
+<body>
 <div class="container">
 <h1>E-Paper</h1>
 
@@ -55,7 +60,34 @@ button:disabled{opacity:.6;cursor:not-allowed}
   </div>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">OSHA Mode</h2>
+  <label><input type="checkbox" id="oshaEnabled"> Enable OSHA mode</label>
+  <label>Incident.io API token</label>
+  <input type="password" id="oshaToken" placeholder="Bearer token">
+  <div class="row" style="margin-top:12px">
+    <button id="saveOshaBtn">Save OSHA settings</button>
+    <button id="refreshOshaBtn" style="background:#16a34a">Run OSHA refresh now</button>
+  </div>
+  <p class="small">Last OSHA status: <span id="oshaDays">0</span> days, <span id="oshaPrior">0</span> prior, <span id="oshaIncident"></span> (<span id="oshaDate"></span>), <span id="oshaReason"></span></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Image Gallery</h2>
+  <label>Select image for gallery</label>
+  <input type="file" id="galleryFile" accept="image/*">
+  <label>Name (letters/numbers/_/-)</label>
+  <input type="text" id="galleryName" placeholder="image name">
+  <div class="row" style="margin-top:12px">
+    <button id="galleryUploadBtn">Upload to Gallery (Fast)</button>
+    <button id="galleryUploadHQBtn" style="background:#4f46e5">Upload to Gallery (HQ)</button>
+  </div>
+  <p class="small">Saved gallery images:</p>
+  <div id="galleryList" class="row"></div>
+</div>
+
 <script>
+// Elements
 var statusEl=document.getElementById('status');
 var infoEl=document.getElementById('info');
 var timerEl=document.getElementById('timer');
@@ -69,6 +101,22 @@ var sleepHoursEl=document.getElementById('sleepHours');
 var saveSleepBtn=document.getElementById('saveSleepBtn');
 
 var sendBtn=document.getElementById('sendBtn');
+
+var oshaEnabledEl=document.getElementById('oshaEnabled');
+var oshaTokenEl=document.getElementById('oshaToken');
+var saveOshaBtn=document.getElementById('saveOshaBtn');
+var refreshOshaBtn=document.getElementById('refreshOshaBtn');
+var oshaDaysEl=document.getElementById('oshaDays');
+var oshaPriorEl=document.getElementById('oshaPrior');
+var oshaIncidentEl=document.getElementById('oshaIncident');
+var oshaDateEl=document.getElementById('oshaDate');
+var oshaReasonEl=document.getElementById('oshaReason');
+
+var galleryFileEl=document.getElementById('galleryFile');
+var galleryNameEl=document.getElementById('galleryName');
+var galleryUploadBtn=document.getElementById('galleryUploadBtn');
+var galleryUploadHQBtn=document.getElementById('galleryUploadHQBtn');
+var galleryListEl=document.getElementById('galleryList');
 
 function logStatus(m){statusEl.textContent=m;}
 function logInfo(m){infoEl.textContent=m;}
@@ -86,6 +134,25 @@ async function fetchStatus(){
     }
     if(document.activeElement !== sleepHoursEl){
       sleepHoursEl.value = d.sleep_hours || 24;
+    }
+    // OSHA state fields if provided
+    if(typeof d.osha_enabled !== 'undefined'){
+      oshaEnabledEl.checked = !!d.osha_enabled;
+    }
+    if(typeof d.osha_days !== 'undefined'){
+      oshaDaysEl.textContent = d.osha_days;
+    }
+    if(typeof d.osha_prior !== 'undefined'){
+      oshaPriorEl.textContent = d.osha_prior;
+    }
+    if(typeof d.osha_incident !== 'undefined'){
+      oshaIncidentEl.textContent = d.osha_incident;
+    }
+    if(typeof d.osha_date !== 'undefined'){
+      oshaDateEl.textContent = d.osha_date;
+    }
+    if(typeof d.osha_reason !== 'undefined'){
+      oshaReasonEl.textContent = d.osha_reason;
     }
   }catch(e){
     logInfo('Unable to load status');
@@ -150,6 +217,7 @@ saveSleepBtn.onclick = async function(){
   await fetchStatus();
 };
 
+// Palette for EPD
 var palette=[
   {code:0x0,r:0,g:0,b:0},
   {code:0x1,r:255,g:255,b:255},
@@ -161,7 +229,7 @@ var palette=[
 ];
 
 function nearestPaletteColor(r,g,b){
-  var best=palette[0], bestDist=1e18;
+  var best=palette[0], bestDist=Infinity;
   for(var i=0;i<palette.length;i++){
     var p=palette[i];
     var dr=r-p.r,dg=g-p.g,db=b-p.b;
@@ -181,7 +249,6 @@ function applyFloydSteinberg(imgData){
       var n=nearestPaletteColor(oldR,oldG,oldB);
       data[idx]=n.r; data[idx+1]=n.g; data[idx+2]=n.b;
       var errR=oldR-n.r, errG=oldG-n.g, errB=oldB-n.b;
-
       function scatter(nx,ny,f){
         if(nx<0||nx>=width||ny<0||ny>=height) return;
         var j=(ny*width+nx)*4;
@@ -208,7 +275,7 @@ function packToEPD(imgData){
   return packed;
 }
 
-function cropFill(image){
+function cropAndDraw(image, applyDither){
   var cw=800,ch=480;
   var canvas=document.createElement('canvas');
   canvas.width=cw; canvas.height=ch;
@@ -216,7 +283,6 @@ function cropFill(image){
   ctx.imageSmoothingEnabled=true;
   ctx.fillStyle='#ffffff';
   ctx.fillRect(0,0,cw,ch);
-
   var portrait=image.height>image.width;
   if(portrait){
     ctx.save();
@@ -236,9 +302,8 @@ function cropFill(image){
     var dy=(ch-dh2)/2;
     ctx.drawImage(image, dx, dy, dw2, dh2);
   }
-
   var imgData=ctx.getImageData(0,0,cw,ch);
-  applyFloydSteinberg(imgData);
+  if(applyDither) applyFloydSteinberg(imgData);
   return packToEPD(imgData);
 }
 
@@ -264,9 +329,8 @@ sendBtn.onclick = async function(){
   reader.onload=function(){
     var img=new Image();
     img.onload=async function(){
-      var bytes=cropFill(img);
- 
-      await uploadPackedByteabcs(bytes, saveName);
+      var bytes=cropAndDraw(img, true);
+      await uploadPackedBytes(bytes, saveName);
       sendBtn.disabled=false;
     };
     img.onerror=function(){ logStatus('Failed to load image.'); sendBtn.disabled=false; };
@@ -275,7 +339,123 @@ sendBtn.onclick = async function(){
   reader.readAsDataURL(file);
 };
 
+saveOshaBtn.onclick = async function(){
+  var enabled = oshaEnabledEl.checked;
+  var token = oshaTokenEl.value.trim();
+  var params = new URLSearchParams();
+  params.append('enabled', enabled ? '1' : '0');
+  if(token) params.append('token', token);
+  await fetch('/osha/config', { method:'POST', body: params });
+  alert('OSHA settings saved');
+  await fetchStatus();
+};
+
+refreshOshaBtn.onclick = async function(){
+  logStatus('Refreshing OSHA...');
+  var res = await fetch('/osha/refresh', { method:'POST' });
+  if(res.ok){
+    logStatus('OSHA refreshed');
+    await fetchStatus();
+  }else{
+    logStatus('OSHA refresh failed');
+  }
+};
+
+async function refreshGallery(){
+  try{
+    var res = await fetch('/images/list');
+    if(!res.ok) return;
+    var list = await res.json();
+    galleryListEl.innerHTML = '';
+    list.forEach(function(name){
+      var item = document.createElement('div');
+      item.className = 'gallery-item';
+      item.innerHTML =
+        '<img src="/images/thumb?name='+encodeURIComponent(name)+'" alt="'+name+'">' +
+        '<button class="showImage" data-name="'+name+'">Show</button>' +
+        '<button class="deleteImage" data-name="'+name+'" style="background:#dc2626">Delete</button>';
+      galleryListEl.appendChild(item);
+    });
+    // Attach event listeners
+    galleryListEl.querySelectorAll('.showImage').forEach(function(btn){
+      btn.onclick = async function(){
+        var n = this.getAttribute('data-name');
+        await fetch('/display/show?name='+encodeURIComponent(n), { method:'POST' });
+        logStatus('Displayed '+n);
+      };
+    });
+    galleryListEl.querySelectorAll('.deleteImage').forEach(function(btn){
+      btn.onclick = async function(){
+        var n = this.getAttribute('data-name');
+        if(!confirm('Delete '+n+'?')) return;
+        await fetch('/images/delete?name='+encodeURIComponent(n), { method:'POST' });
+        await refreshGallery();
+      };
+    });
+  }catch(e){
+    console.error(e);
+  }
+}
+
+galleryUploadBtn.onclick = async function(){
+  var file = galleryFileEl.files[0];
+  var name = galleryNameEl.value.trim();
+  if(!file){ alert('Select a file'); return; }
+  logStatus('Converting...');
+  var reader = new FileReader();
+  reader.onload=function(){
+    var img = new Image();
+    img.onload=async function(){
+      var bytes = cropAndDraw(img, false); // fast (no dithering)
+      var fd = new FormData();
+      fd.append('file', new Blob([bytes], {type:'application/octet-stream'}), 'image.bin');
+      var query = name ? ('?name='+encodeURIComponent(name)) : '';
+      var r = await fetch('/images/upload'+query, { method:'POST', body: fd });
+      if(r.ok){
+        logStatus('Uploaded');
+        await refreshGallery();
+      }else{
+        logStatus('Upload failed');
+      }
+    };
+    img.onerror=function(){ logStatus('Failed to load image'); };
+    img.src = reader.result;
+  };
+  reader.readAsDataURL(file);
+};
+
+galleryUploadHQBtn.onclick = async function(){
+  var file = galleryFileEl.files[0];
+  var name = galleryNameEl.value.trim();
+  if(!file){ alert('Select a file'); return; }
+  logStatus('Converting...');
+  var reader = new FileReader();
+  reader.onload=function(){
+    var img = new Image();
+    img.onload=async function(){
+      var bytes = cropAndDraw(img, true); // apply dithering
+      var fd = new FormData();
+      fd.append('file', new Blob([bytes], {type:'application/octet-stream'}), 'image.bin');
+      var query = name ? ('?name='+encodeURIComponent(name)) : '';
+      var r = await fetch('/images/upload'+query, { method:'POST', body: fd });
+      if(r.ok){
+        logStatus('Uploaded');
+        await refreshGallery();
+      }else{
+        logStatus('Upload failed');
+      }
+    };
+    img.onerror=function(){ logStatus('Failed to load image'); };
+    img.src = reader.result;
+  };
+  reader.readAsDataURL(file);
+};
+
+// Initial fetches
 fetchStatus();
 fetchSession();
+refreshGallery();
 </script>
-</div></body></html>
+</div>
+</body>
+</html>
