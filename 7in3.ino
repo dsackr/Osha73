@@ -110,6 +110,15 @@ String currentIP = "";
 
 bool sdMounted = false;
 bool wifiPowerSave = true;
+File galleryFile;
+String galleryFileName;
+size_t galleryBytesWritten = 0;
+
+bool oshaEnabled = false;
+String oshaToken = "";
+String oshaBaseUrl = "https://api.incident.io/v2/incidents";
+
+
 
 String pullUrl = "";
 uint32_t sleepHours = 24;  // Default: wake once per day
@@ -123,6 +132,16 @@ File currentImageFile;
 // ================= Forward declarations =================
 void SPI_Write(unsigned char value);
 void Epaper_Write_Command(unsigned char command);
+void ensureGalleryDir();
+String sanitizeGalleryFileName(const String &name);
+void handleImagesUploadStream();
+void handleImagesUploadDone();
+void handleImagesList();
+void handleImagesThumb();
+void handleImagesDelete();
+void handleDisplayShow();
+void handleOshaRefresh();
+
 void Epaper_Write_Data(unsigned char data);
 void Epaper_READBUSY(void);
 void EPD_Init(void);
