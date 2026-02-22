@@ -117,6 +117,9 @@ var galleryNameEl=document.getElementById('galleryName');
 var galleryUploadBtn=document.getElementById('galleryUploadBtn');
 var galleryUploadHQBtn=document.getElementById('galleryUploadHQBtn');
 var galleryListEl=document.getElementById('galleryList');
+var EPD_WIDTH=800;
+var EPD_HEIGHT=480;
+var EPD_BUFFER_SIZE=EPD_WIDTH*EPD_HEIGHT/2;
 
 function logStatus(m){statusEl.textContent=m;}
 function logInfo(m){infoEl.textContent=m;}
@@ -227,6 +230,8 @@ var palette=[
   {code:0x6,r:0,g:128,b:0},
   {code:0x7,r:255,g:255,b:255}
 ];
+var paletteByCode={};
+palette.forEach(function(p){ paletteByCode[p.code]=p; });
 
 function nearestPaletteColor(r,g,b){
   var best=palette[0], bestDist=Infinity;
@@ -307,6 +312,97 @@ function cropAndDraw(image, applyDither){
   return packToEPD(imgData);
 }
 
+// Decode packed 4-bit EPD bytes into a preview thumbnail.
+// Stored gallery .bin images are 800x480 and contain two pixels per byte (high nibble + low nibble).
+async function generateThumbnail(name){
+  var res = await fetch('/images/raw?name='+encodeURIComponent(name));
+  if(!res.ok) throw new Error('Raw image fetch failed');
+
+  var packed = new Uint8Array(await res.arrayBuffer());
+  if(packed.length < EPD_BUFFER_SIZE) throw new Error('Invalid packed image size');
+
+  var fullCanvas = document.createElement('canvas');
+  fullCanvas.width = EPD_WIDTH;
+  fullCanvas.height = EPD_HEIGHT;
+  var fullCtx = fullCanvas.getContext('2d');
+  var frame = fullCtx.createImageData(EPD_WIDTH, EPD_HEIGHT);
+
+  for(var i=0;i<EPD_BUFFER_SIZE;i++){
+    var hi = (packed[i] >> 4) & 0x0F;
+    var lo = packed[i] & 0x0F;
+    var base = i * 8;
+    var ph = paletteByCode[hi] || paletteByCode[0x1];
+    var pl = paletteByCode[lo] || paletteByCode[0x1];
+
+    frame.data[base] = ph.r;
+    frame.data[base+1] = ph.g;
+    frame.data[base+2] = ph.b;
+    frame.data[base+3] = 255;
+
+    frame.data[base+4] = pl.r;
+    frame.data[base+5] = pl.g;
+    frame.data[base+6] = pl.b;
+    frame.data[base+7] = 255;
+  }
+
+  fullCtx.putImageData(frame, 0, 0);
+
+  var thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = 100;
+  thumbCanvas.height = 60;
+  thumbCanvas.getContext('2d').drawImage(fullCanvas, 0, 0, 100, 60);
+  return thumbCanvas.toDataURL('image/png');
+}
+
+function createLocalThumbnail(image){
+  var thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = 100;
+  thumbCanvas.height = 60;
+  var tctx = thumbCanvas.getContext('2d');
+  tctx.fillStyle = '#000';
+  tctx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
+
+  var scale = Math.min(thumbCanvas.width / image.width, thumbCanvas.height / image.height);
+  var dw = image.width * scale;
+  var dh = image.height * scale;
+  var dx = (thumbCanvas.width - dw) / 2;
+  var dy = (thumbCanvas.height - dh) / 2;
+  tctx.drawImage(image, dx, dy, dw, dh);
+  return thumbCanvas.toDataURL('image/png');
+}
+
+function createGalleryItem(name, thumbSrc){
+  var item = document.createElement('div');
+  item.className = 'gallery-item';
+
+  var img = document.createElement('img');
+  img.alt = name;
+  if(thumbSrc) img.src = thumbSrc;
+  item.appendChild(img);
+
+  var showBtn = document.createElement('button');
+  showBtn.className = 'showImage';
+  showBtn.textContent = 'Show';
+  showBtn.onclick = async function(){
+    await fetch('/display/show?name='+encodeURIComponent(name), { method:'POST' });
+    logStatus('Displayed '+name);
+  };
+  item.appendChild(showBtn);
+
+  var delBtn = document.createElement('button');
+  delBtn.className = 'deleteImage';
+  delBtn.style.background = '#dc2626';
+  delBtn.textContent = 'Delete';
+  delBtn.onclick = async function(){
+    if(!confirm('Delete '+name+'?')) return;
+    await fetch('/images/delete?name='+encodeURIComponent(name), { method:'POST' });
+    await refreshGallery();
+  };
+  item.appendChild(delBtn);
+
+  return { item:item, img:img };
+}
+
 async function uploadPackedBytes(bytes, saveName){
   logStatus('Uploading...');
   var fd = new FormData();
@@ -368,29 +464,16 @@ async function refreshGallery(){
     var list = await res.json();
     galleryListEl.innerHTML = '';
     list.forEach(function(name){
-      var item = document.createElement('div');
-      item.className = 'gallery-item';
-      item.innerHTML =
-        '<img src="/images/thumb?name='+encodeURIComponent(name)+'" alt="'+name+'">' +
-        '<button class="showImage" data-name="'+name+'">Show</button>' +
-        '<button class="deleteImage" data-name="'+name+'" style="background:#dc2626">Delete</button>';
-      galleryListEl.appendChild(item);
-    });
-    // Attach event listeners
-    galleryListEl.querySelectorAll('.showImage').forEach(function(btn){
-      btn.onclick = async function(){
-        var n = this.getAttribute('data-name');
-        await fetch('/display/show?name='+encodeURIComponent(n), { method:'POST' });
-        logStatus('Displayed '+n);
-      };
-    });
-    galleryListEl.querySelectorAll('.deleteImage').forEach(function(btn){
-      btn.onclick = async function(){
-        var n = this.getAttribute('data-name');
-        if(!confirm('Delete '+n+'?')) return;
-        await fetch('/images/delete?name='+encodeURIComponent(n), { method:'POST' });
-        await refreshGallery();
-      };
+      var card = createGalleryItem(name, '');
+      card.img.title = 'Loading thumbnail...';
+      galleryListEl.appendChild(card.item);
+      generateThumbnail(name).then(function(src){
+        card.img.src = src;
+        card.img.title = name;
+      }).catch(function(){
+        card.img.alt = name+' (thumbnail unavailable)';
+        card.img.title = 'Thumbnail unavailable';
+      });
     });
   }catch(e){
     console.error(e);
@@ -412,8 +495,10 @@ galleryUploadBtn.onclick = async function(){
       var query = name ? ('?name='+encodeURIComponent(name)) : '';
       var r = await fetch('/images/upload'+query, { method:'POST', body: fd });
       if(r.ok){
+        var data = await r.json();
+        var card = createGalleryItem(data.name || name || 'image', createLocalThumbnail(img));
+        galleryListEl.prepend(card.item);
         logStatus('Uploaded');
-        await refreshGallery();
       }else{
         logStatus('Upload failed');
       }
@@ -439,8 +524,10 @@ galleryUploadHQBtn.onclick = async function(){
       var query = name ? ('?name='+encodeURIComponent(name)) : '';
       var r = await fetch('/images/upload'+query, { method:'POST', body: fd });
       if(r.ok){
+        var data = await r.json();
+        var card = createGalleryItem(data.name || name || 'image', createLocalThumbnail(img));
+        galleryListEl.prepend(card.item);
         logStatus('Uploaded');
-        await refreshGallery();
       }else{
         logStatus('Upload failed');
       }
