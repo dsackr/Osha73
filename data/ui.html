@@ -40,14 +40,14 @@ button:disabled{opacity:.6;cursor:not-allowed}
   <div class="row" style="margin-top:12px">
     <button id="savePullBtn">Save Pull URL</button>
   </div>
-  <p class="small">On boot (STA mode), device will GET this once expecting 192000 raw bytes.</p>
+  <p class="small">Pull URL can be used for manual image workflows.</p>
   
   <label style="margin-top:20px">Auto-refresh interval (hours)</label>
   <input type="number" id="sleepHours" min="1" max="168" value="24">
   <div class="row" style="margin-top:12px">
     <button id="saveSleepBtn">Save Interval</button>
   </div>
-  <p class="small">Device will wake from deep sleep after this many hours to refresh the display (1-168 hours).</p>
+  <p class="small">When OSHA mode is ON, max interval is 24h. In Picture mode, 1-168h is allowed.</p>
 </div>
 
 <div class="card">
@@ -61,14 +61,15 @@ button:disabled{opacity:.6;cursor:not-allowed}
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">OSHA Mode</h2>
-  <label><input type="checkbox" id="oshaEnabled"> Enable OSHA mode</label>
+  <h2 style="margin-top:0">Display Mode</h2>
+  <label><input type="checkbox" id="oshaEnabled"> OSHA mode (unchecked = Picture mode)</label>
   <label>Incident.io API token</label>
   <input type="password" id="oshaToken" placeholder="Bearer token">
   <div class="row" style="margin-top:12px">
-    <button id="saveOshaBtn">Save OSHA settings</button>
+    <button id="saveOshaBtn">Save Display Mode</button>
     <button id="refreshOshaBtn" style="background:#16a34a">Run OSHA refresh now</button>
   </div>
+  <p class="small">If OSHA mode is enabled but no API key is saved, boot screen will show setup instructions.</p>
   <p class="small">Last OSHA status: <span id="oshaDays">0</span> days, <span id="oshaPrior">0</span> prior, <span id="oshaIncident"></span> (<span id="oshaDate"></span>), <span id="oshaReason"></span></p>
 </div>
 
@@ -131,7 +132,9 @@ async function fetchStatus(){
   try{
     var res=await fetch('/status');
     var d=await res.json();
-    logInfo('SSID: '+d.ssid+' | IP: '+d.ip+' | Battery: '+d.battery_percent+'% ('+d.battery_voltage+' V) | '+d.battery_state+' ('+d.battery_crate_pct_per_hr+' %/hr) | WiFiPS: '+d.wifi_powersave);
+    var modeLabel = d.osha_enabled ? 'OSHA' : 'Picture';
+    var tokenLabel = d.osha_token_configured ? 'configured' : 'missing';
+    logInfo('SSID: '+d.ssid+' | IP: '+d.ip+' | Battery: '+d.battery_percent+'% ('+d.battery_voltage+' V) | '+d.battery_state+' ('+d.battery_crate_pct_per_hr+' %/hr) | Mode: '+modeLabel+' | API key: '+tokenLabel);
     if(document.activeElement !== pullUrlEl){
       pullUrlEl.value = d.pull_url || '';
     }
@@ -209,6 +212,10 @@ saveSleepBtn.onclick = async function(){
   var hours = parseInt(sleepHoursEl.value);
   if(isNaN(hours) || hours < 1 || hours > 168){
     alert('Hours must be between 1 and 168');
+    return;
+  }
+  if(oshaEnabledEl.checked && hours > 24){
+    alert('When OSHA mode is enabled, interval must be 24 hours or less');
     return;
   }
   var res = await fetch('/sleepconfig', {
@@ -442,7 +449,7 @@ saveOshaBtn.onclick = async function(){
   params.append('enabled', enabled ? '1' : '0');
   if(token) params.append('token', token);
   await fetch('/osha/config', { method:'POST', body: params });
-  alert('OSHA settings saved');
+  alert('Display mode settings saved');
   await fetchStatus();
 };
 

@@ -223,6 +223,8 @@ void maybeOpenSDForSave();
 bool fetchAndDisplayOneShot();
 void shutdownForever();
 void writeDisplayRefreshSequence();
+void setOshaModeEnabled(bool enabled);
+void displayOshaSetupMessage();
 bool ensureOshaConfigJson();
 bool loadOshaLayout(OshaLayout &layout);
 bool loadOshaStateFromSd(OshaState &state);
@@ -886,6 +888,7 @@ void handleStatus() {
   json += "\"sd_mounted\":" + String(sdMounted ? "true" : "false") + ",";
   json += "\"sd_setup_required\":" + String(sdSetupRequired ? "true" : "false") + ",";
   json += "\"osha_enabled\":" + String(oshaEnabled ? "true" : "false") + ",";
+  json += "\"osha_token_configured\":" + String(oshaToken.length() > 0 ? "true" : "false") + ",";
   json += "\"osha_days\":" + String(oshaDays) + ",";
   json += "\"osha_prior\":" + String(oshaPrior) + ",";
   json += "\"osha_incident\":\"" + oshaIncident + "\",";
@@ -928,8 +931,13 @@ void handleSleepConfig() {
   if (!server.hasArg("hours")) { server.send(400, "application/json", "{\"error\":\"missing hours\"}"); return; }
 
   int hours = server.arg("hours").toInt();
-  if (hours < 1 || hours > 168) { // 1 hour to 1 week
+  if (hours < 1 || hours > 168) {
     server.send(400, "application/json", "{\"error\":\"hours must be between 1 and 168\"}");
+    return;
+  }
+
+  if (oshaEnabled && hours > 24) {
+    server.send(400, "application/json", "{\"error\":\"hours must be <= 24 when OSHA mode is enabled\"}");
     return;
   }
 
@@ -1007,6 +1015,7 @@ void handleUploadDone() {
 
   if (currentImageFile) currentImageFile.close();
 
+  setOshaModeEnabled(false);
   uploadInProgress = false;
   pendingDisplayRefresh = true;
 
@@ -1363,17 +1372,22 @@ bool refreshOshaAndMaybeDisplay(bool forceDisplay) {
 
 void handleOshaConfig() {
   int enabled = server.hasArg("enabled") ? server.arg("enabled").toInt() : (oshaEnabled ? 1 : 0);
-  oshaEnabled = enabled == 1;
+  bool enablingOsha = (enabled == 1);
+  setOshaModeEnabled(enablingOsha);
   preferences.begin("epaper", false);
-  preferences.putBool("osha_enabled", oshaEnabled);
   if (server.hasArg("token") && server.arg("token").length() > 0) {
     oshaToken = server.arg("token");
     preferences.putString("osha_token", oshaToken);
+  }
+  if (enablingOsha && sleepHours > 24) {
+    sleepHours = 24;
+    preferences.putUInt("sleepHours", sleepHours);
   }
   preferences.putString("osha_url", oshaBaseUrl);
   preferences.end();
   server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
+
 
 void handleOshaRefresh() {
   if (!oshaEnabled) { server.send(400, "application/json", "{\"error\":\"osha disabled\"}"); return; }
@@ -1487,7 +1501,25 @@ void handleDisplayShow() {
   Epaper_READBUSY();
   EPD_DeepSleep();
   displayBusy = false;
+  setOshaModeEnabled(false);
   server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void setOshaModeEnabled(bool enabled) {
+  oshaEnabled = enabled;
+  preferences.begin("epaper", false);
+  preferences.putBool("osha_enabled", oshaEnabled);
+  preferences.end();
+}
+
+void displayOshaSetupMessage() {
+  String line2 = "Open: http://" + currentIP + "/ui";
+  displayTextScreen(
+    "OSHA MODE READY",
+    "Missing incident.io API key",
+    line2.c_str(),
+    "Set key or upload image"
+  );
 }
 
 // ================= One-shot pull =================
@@ -1613,10 +1645,12 @@ void shutdownForever() {
   gpio_reset_pin((gpio_num_t)STATUS_LED_PIN);
 
   // Wake up after configured sleep duration (default 24 hours)
-  uint64_t sleepTimeMicros = (uint64_t)sleepHours * 60ULL * 60ULL * 1000000ULL;
+  uint32_t effectiveSleepHours = sleepHours;
+  if (oshaEnabled && effectiveSleepHours > 24) effectiveSleepHours = 24;
+  uint64_t sleepTimeMicros = (uint64_t)effectiveSleepHours * 60ULL * 60ULL * 1000000ULL;
   esp_sleep_enable_timer_wakeup(sleepTimeMicros);
 
-  Serial.printf("Going to sleep for %u hours...\n", sleepHours);
+  Serial.printf("Going to sleep for %u hours...\n", effectiveSleepHours);
   delay(100); // Give serial time to send
 
   esp_deep_sleep_start();
@@ -1670,8 +1704,13 @@ void setup() {
 
   if (!isAPMode) {
     delay(ONE_SHOT_DELAY_MS);
-    if (oshaEnabled) (void)refreshOshaAndMaybeDisplay(false);
-    (void)fetchAndDisplayOneShot();
+    if (oshaEnabled) {
+      if (oshaToken.length() == 0) {
+        displayOshaSetupMessage();
+      } else {
+        (void)refreshOshaAndMaybeDisplay(false);
+      }
+    }
   }
 }
 
