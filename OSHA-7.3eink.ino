@@ -113,6 +113,7 @@ String currentSSID = "";
 String currentIP = "";
 
 bool sdMounted = false;
+bool sdSetupRequired = false;
 bool wifiPowerSave = true;
 File galleryFile;
 String galleryFileName;
@@ -178,6 +179,12 @@ File currentImageFile;
 void SPI_Write(unsigned char value);
 void Epaper_Write_Command(unsigned char command);
 void ensureGalleryDir();
+bool ensureDirectory(const char *path);
+bool sdCardNeedsSetup();
+bool downloadFileToSd(const char *url, const char *destPath);
+bool configureSdCardDefaults(String &errorOut);
+void handleSdSetupPage();
+void handleSdSetupRun();
 String sanitizeGalleryFileName(const String &name);
 void handleImagesUploadStream();
 void handleImagesUploadDone();
@@ -523,6 +530,109 @@ void ensureGalleryDir() {
   if (!SD.exists("/osha")) SD.mkdir("/osha");
 }
 
+bool ensureDirectory(const char *path) {
+  if (!sdMounted) return false;
+  if (SD.exists(path)) return true;
+  return SD.mkdir(path);
+}
+
+bool sdCardNeedsSetup() {
+  if (!sdMounted) return false;
+
+  if (!SD.exists("/gallery")) return true;
+  if (!SD.exists("/gallery/.thumbs")) return true;
+  if (!SD.exists("/osha")) return true;
+
+  if (!SD.exists("/osha/background.bin")) return true;
+  if (!SD.exists("/background.png")) return true;
+  if (!SD.exists("/ui.html")) return true;
+  if (!SD.exists("/ap.html")) return true;
+
+  return false;
+}
+
+bool downloadFileToSd(const char *url, const char *destPath) {
+  HTTPClient http;
+  http.setTimeout(12000);
+  if (!http.begin(url)) return false;
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  if (SD.exists(destPath)) SD.remove(destPath);
+  File out = SD.open(destPath, FILE_WRITE);
+  if (!out) {
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buf[1024];
+
+  while (http.connected()) {
+    int avail = stream->available();
+    if (avail <= 0) {
+      if (!http.connected()) break;
+      delay(2);
+      continue;
+    }
+
+    int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
+    if (n <= 0) break;
+    out.write(buf, (size_t)n);
+  }
+
+  if (!out) {
+    out.close();
+    SD.remove(destPath);
+    http.end();
+    return false;
+  }
+
+  out.close();
+  http.end();
+  return true;
+}
+
+bool configureSdCardDefaults(String &errorOut) {
+  if (!sdMounted) {
+    errorOut = "sd unavailable";
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    errorOut = "wifi not connected";
+    return false;
+  }
+
+  if (!ensureDirectory("/gallery")) { errorOut = "failed to create /gallery"; return false; }
+  if (!ensureDirectory("/gallery/.thumbs")) { errorOut = "failed to create /gallery/.thumbs"; return false; }
+  if (!ensureDirectory("/osha")) { errorOut = "failed to create /osha"; return false; }
+
+  if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/background.bin", "/osha/background.bin")) {
+    errorOut = "failed to download /osha/background.bin";
+    return false;
+  }
+  if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/background.png", "/background.png")) {
+    errorOut = "failed to download /background.png";
+    return false;
+  }
+  if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ui.html", "/ui.html")) {
+    errorOut = "failed to download /ui.html";
+    return false;
+  }
+  if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ap.html", "/ap.html")) {
+    errorOut = "failed to download /ap.html";
+    return false;
+  }
+
+  sdSetupRequired = sdCardNeedsSetup();
+  errorOut = "";
+  return !sdSetupRequired;
+}
+
 void maybeOpenSDForSave() {
   if (!sdMounted) return;
   if (!server.hasArg("save")) return;
@@ -591,6 +701,12 @@ void setupWiFi(void) {
 
 // ================= Web handlers =================
 void handleRoot() {
+  if (!isAPMode && sdSetupRequired) {
+    server.sendHeader("Location", "/sd/setup", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
+
   if (isAPMode) {
     // Try to serve from LittleFS first
     if (LittleFS.exists("/ap.html")) {
@@ -629,7 +745,55 @@ void handleRoot() {
 }
 
 void handleUi() {
+  if (!isAPMode && sdSetupRequired) {
+    server.sendHeader("Location", "/sd/setup", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
   handleRoot(); // Same as root for now
+}
+
+void handleSdSetupPage() {
+  if (isAPMode) {
+    server.send(400, "text/html", "<html><body><h3>SD setup requires WiFi STA mode.</h3></body></html>");
+    return;
+  }
+  if (!sdMounted) {
+    server.send(500, "text/html", "<html><body><h3>SD card not detected.</h3></body></html>");
+    return;
+  }
+
+  String html =
+    "<html><body style='font-family:sans-serif;max-width:640px;'>"
+    "<h2>SD Card Setup Required</h2>"
+    "<p>The SD card is mounted but missing one or more required files/folders.</p>"
+    "<ul>"
+    "<li>/gallery/</li>"
+    "<li>/gallery/.thumbs/</li>"
+    "<li>/osha/</li>"
+    "<li>/osha/background.bin</li>"
+    "<li>/background.png</li>"
+    "<li>/ui.html</li>"
+    "<li>/ap.html</li>"
+    "</ul>"
+    "<p>Click configure to create missing folders and download default files from GitHub.</p>"
+    "<form action='/sd/setup/run' method='POST'>"
+    "<button type='submit'>Configure SD Card</button>"
+    "</form>"
+    "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleSdSetupRun() {
+  String error;
+  bool ok = configureSdCardDefaults(error);
+  if (!ok) {
+    String json = String("{\"status\":\"error\",\"message\":\"") + error + "\"}";
+    server.send(500, "application/json", json);
+    return;
+  }
+  server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"sd configured\"}");
 }
 
 // Save WiFi creds (works in AP or STA mode)
@@ -719,6 +883,8 @@ void handleStatus() {
   json += "\"sleep_hours\":" + String(sleepHours) + ",";
   json += "\"ms_left\":" + String(msLeft) + ",";
   json += "\"busy\":" + String(displayBusy ? "true" : "false") + ",";
+  json += "\"sd_mounted\":" + String(sdMounted ? "true" : "false") + ",";
+  json += "\"sd_setup_required\":" + String(sdSetupRequired ? "true" : "false") + ",";
   json += "\"osha_enabled\":" + String(oshaEnabled ? "true" : "false") + ",";
   json += "\"osha_days\":" + String(oshaDays) + ",";
   json += "\"osha_prior\":" + String(oshaPrior) + ",";
@@ -1403,6 +1569,8 @@ void setupWebServer() {
   server.on("/wifi/clear", HTTP_POST, handleClearWiFi);
 
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/sd/setup", HTTP_GET, handleSdSetupPage);
+  server.on("/sd/setup/run", HTTP_POST, handleSdSetupRun);
   server.on("/session", HTTP_GET, handleSession);
   server.on("/extend", HTTP_POST, handleExtend);
   server.on("/pullurl", HTTP_POST, handlePullUrl);
@@ -1497,6 +1665,7 @@ void setup() {
   fuelGaugeOk = max17048Read16(REG_VCELL, tmp);
 
   setupWiFi();
+  sdSetupRequired = (!isAPMode) ? sdCardNeedsSetup() : false;
   setupWebServer();
 
   if (!isAPMode) {

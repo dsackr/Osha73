@@ -36,6 +36,8 @@ After first boot, firmware auto-creates:
 - `/osha/config.json`
 - `/osha/state.json`
 
+If the device boots in **STA mode** (connected to WiFi), detects an SD card, and finds the SD layout incomplete, it now redirects to `/sd/setup` where you can run one-click SD setup. That flow creates required folders and downloads default files from the GitHub repo directly to the SD card.
+
 If your workflow includes uploading web assets/FS content from Arduino tools, keep the same final paths shown above on the SD card.
 
 ## SD card layout
@@ -78,7 +80,12 @@ If your workflow includes uploading web assets/FS content from Arduino tools, ke
 - `POST /osha/refresh`
   - Forces fetch/compute/render now
 - `GET /status`
-  - Now includes: `osha_enabled`, `osha_days`, `osha_prior`, `osha_incident`, `osha_date`, `osha_reason`
+  - Now includes: `osha_enabled`, `osha_days`, `osha_prior`, `osha_incident`, `osha_date`, `osha_reason`, `sd_mounted`, `sd_setup_required`
+
+- `GET /sd/setup`
+  - Setup page shown when SD is mounted but required files/folders are missing
+- `POST /sd/setup/run`
+  - Creates required SD directories and downloads default assets from GitHub
 
 - `POST /images/upload[?name=<safeName>]`
   - Upload exactly `192000` bytes packed image to `/gallery/<name>.bin`
