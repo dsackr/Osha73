@@ -9,7 +9,7 @@ These steps assume you already know your ESP32-C6 Arduino setup and hardware wir
 1. Clone the repo and open it:
 
    ```bash
-   git clone https://github.com/<your-org-or-user>/OSHA-7.3eink.git
+   git clone https://github.com/dsackr/OSHA-7.3eink.git
    cd OSHA-7.3eink
    ```
 
