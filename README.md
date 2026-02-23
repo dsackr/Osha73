@@ -2,6 +2,42 @@
 
 Updated firmware adds **on-device OSHA incident mode**, **SD-backed gallery management**, and **asynchronous display upload refresh** while preserving AP fallback, deep sleep, manual upload, one-shot pull, and battery overlay behavior.
 
+## Install (ESP32-C6 + Arduino)
+
+These steps assume you already know your ESP32-C6 Arduino setup and hardware wiring.
+
+1. Clone the repo and open it:
+
+   ```bash
+   git clone https://github.com/<your-org-or-user>/OSHA-7.3eink.git
+   cd OSHA-7.3eink
+   ```
+
+2. Open `7in3.ino` in the Arduino IDE.
+3. Select your ESP32-C6 board/port and flash as usual.
+
+## Prepare the SD card
+
+Use a FAT32 SD card and copy these files/folders from the repo root:
+
+- `background.bin` → `/osha/background.bin`
+- `data/background.png` → `/background.png`
+- `data/ui.html` → `/ui.html`
+- `data/ap.html` → `/ap.html`
+
+Create these folders if they do not exist:
+
+- `/gallery/`
+- `/gallery/.thumbs/`
+- `/osha/`
+
+After first boot, firmware auto-creates:
+
+- `/osha/config.json`
+- `/osha/state.json`
+
+If your workflow includes uploading web assets/FS content from Arduino tools, keep the same final paths shown above on the SD card.
+
 ## SD card layout
 
 - `/gallery/` — saved packed `.bin` images
@@ -75,4 +111,3 @@ Updated firmware adds **on-device OSHA incident mode**, **SD-backed gallery mana
 4. Call `/images/delete?name=test`; verify file removed.
 5. Set OSHA token with `/osha/config`, run `/osha/refresh`, confirm `/status` OSHA fields populate.
 6. Re-run `/osha/refresh` without data change; verify no unnecessary render when state unchanged.
-
