@@ -27,6 +27,7 @@
 #include <LittleFS.h>
 #include <esp_sleep.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <vector>
 #include <algorithm>
 #include <time.h>
@@ -183,6 +184,7 @@ bool ensureDirectory(const char *path);
 bool sdCardNeedsSetup();
 bool downloadFileToSd(const char *url, const char *destPath);
 bool configureSdCardDefaults(String &errorOut);
+void logSdSetup(const char *fmt, ...);
 void handleSdSetupPage();
 void handleSdSetupRun();
 String sanitizeGalleryFileName(const String &name);
@@ -553,30 +555,69 @@ bool sdCardNeedsSetup() {
   return false;
 }
 
+void logSdSetup(const char *fmt, ...) {
+  char message[220];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(message, sizeof(message), fmt, args);
+  va_end(args);
+  Serial.printf("SD_SETUP: %s\n", message);
+}
+
 bool downloadFileToSd(const char *url, const char *destPath) {
+  logSdSetup("download start %s -> %s", url, destPath);
   HTTPClient http;
   http.setTimeout(12000);
-  if (!http.begin(url)) return false;
+  if (!http.begin(url)) {
+    logSdSetup("download begin failed for %s", url);
+    return false;
+  }
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
+    logSdSetup("download http status %d for %s", code, url);
     http.end();
     return false;
   }
 
+  int expectedLength = http.getSize();
+  logSdSetup("download http 200 for %s (content-length=%d)", destPath, expectedLength);
+
   if (SD.exists(destPath)) SD.remove(destPath);
   File out = SD.open(destPath, FILE_WRITE);
   if (!out) {
+    logSdSetup("download open failed for %s", destPath);
     http.end();
     return false;
   }
 
   WiFiClient *stream = http.getStreamPtr();
   uint8_t buf[1024];
+  size_t totalWritten = 0;
+  unsigned long startedAt = millis();
+  unsigned long lastProgressLog = startedAt;
+  unsigned long lastDataAt = startedAt;
+  const unsigned long STALL_TIMEOUT_MS = 15000;
 
   while (http.connected()) {
     int avail = stream->available();
     if (avail <= 0) {
+      unsigned long now = millis();
+      if (now - lastDataAt > STALL_TIMEOUT_MS) {
+        logSdSetup("download stalled for %s after %lu ms (wrote=%u bytes)",
+                   destPath, now - startedAt, (unsigned int)totalWritten);
+        out.close();
+        SD.remove(destPath);
+        http.end();
+        return false;
+      }
+
+      if (now - lastProgressLog > 3000) {
+        logSdSetup("download waiting for data %s (wrote=%u bytes so far)",
+                   destPath, (unsigned int)totalWritten);
+        lastProgressLog = now;
+      }
+
       if (!http.connected()) break;
       delay(2);
       continue;
@@ -585,9 +626,23 @@ bool downloadFileToSd(const char *url, const char *destPath) {
     int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
     if (n <= 0) break;
     out.write(buf, (size_t)n);
+    totalWritten += (size_t)n;
+
+    unsigned long now = millis();
+    lastDataAt = now;
+    if (now - lastProgressLog > 2000) {
+      if (expectedLength > 0) {
+        logSdSetup("download progress %s: %u/%d bytes", destPath,
+                   (unsigned int)totalWritten, expectedLength);
+      } else {
+        logSdSetup("download progress %s: %u bytes", destPath, (unsigned int)totalWritten);
+      }
+      lastProgressLog = now;
+    }
   }
 
   if (!out) {
+    logSdSetup("download write failed for %s", destPath);
     out.close();
     SD.remove(destPath);
     http.end();
@@ -596,42 +651,59 @@ bool downloadFileToSd(const char *url, const char *destPath) {
 
   out.close();
   http.end();
+  logSdSetup("download complete %s (%u bytes in %lu ms)",
+             destPath, (unsigned int)totalWritten, millis() - startedAt);
   return true;
 }
 
 bool configureSdCardDefaults(String &errorOut) {
+  logSdSetup("configure requested (wifi=%d, sdMounted=%d)",
+             WiFi.status() == WL_CONNECTED ? 1 : 0,
+             sdMounted ? 1 : 0);
   if (!sdMounted) {
+    logSdSetup("configure aborted: sd unavailable");
     errorOut = "sd unavailable";
     return false;
   }
   if (WiFi.status() != WL_CONNECTED) {
+    logSdSetup("configure aborted: wifi not connected");
     errorOut = "wifi not connected";
     return false;
   }
 
+  logSdSetup("ensuring required directories");
   if (!ensureDirectory("/gallery")) { errorOut = "failed to create /gallery"; return false; }
+  logSdSetup("directory ready: /gallery");
   if (!ensureDirectory("/gallery/.thumbs")) { errorOut = "failed to create /gallery/.thumbs"; return false; }
+  logSdSetup("directory ready: /gallery/.thumbs");
   if (!ensureDirectory("/osha")) { errorOut = "failed to create /osha"; return false; }
+  logSdSetup("directory ready: /osha");
 
+  logSdSetup("starting required asset downloads");
   if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/background.bin", "/osha/background.bin")) {
     errorOut = "failed to download /osha/background.bin";
+    logSdSetup("configure failed: %s", errorOut.c_str());
     return false;
   }
   if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/background.png", "/background.png")) {
     errorOut = "failed to download /background.png";
+    logSdSetup("configure failed: %s", errorOut.c_str());
     return false;
   }
   if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ui.html", "/ui.html")) {
     errorOut = "failed to download /ui.html";
+    logSdSetup("configure failed: %s", errorOut.c_str());
     return false;
   }
   if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ap.html", "/ap.html")) {
     errorOut = "failed to download /ap.html";
+    logSdSetup("configure failed: %s", errorOut.c_str());
     return false;
   }
 
   sdSetupRequired = sdCardNeedsSetup();
   errorOut = "";
+  logSdSetup("configure complete (sdSetupRequired=%d)", sdSetupRequired ? 1 : 0);
   return !sdSetupRequired;
 }
 
@@ -788,13 +860,16 @@ void handleSdSetupPage() {
 }
 
 void handleSdSetupRun() {
+  logSdSetup("HTTP /sd/setup/run invoked from %s", server.client().remoteIP().toString().c_str());
   String error;
   bool ok = configureSdCardDefaults(error);
   if (!ok) {
+    logSdSetup("HTTP /sd/setup/run failed: %s", error.c_str());
     String json = String("{\"status\":\"error\",\"message\":\"") + error + "\"}";
     server.send(500, "application/json", json);
     return;
   }
+  logSdSetup("HTTP /sd/setup/run succeeded");
   server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"sd configured\"}");
 }
 
