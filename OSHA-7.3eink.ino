@@ -21,6 +21,7 @@
 #include <DNSServer.h>
 #include <Wire.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SD.h>
@@ -1335,24 +1336,35 @@ bool fetchOshaState(OshaState &stateOut) {
     String url = oshaBaseUrl;
     if (cursor.length() > 0) url += "?cursor=" + cursor;
 
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+
     HTTPClient http;
     http.setTimeout(12000);
     Serial.printf("OSHA: fetching incidents from %s\n", url.c_str());
-    if (!http.begin(url)) {
-      Serial.println("OSHA: failed to start HTTP client");
+    if (!http.begin(secureClient, url)) {
+      Serial.println("OSHA: failed to start HTTPS client");
       return false;
     }
     http.addHeader("Authorization", "Bearer " + oshaToken);
     http.addHeader("Accept", "application/json");
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
-      Serial.printf("OSHA: API GET failed with code %d\n", code);
+      String err = http.errorToString(code);
+      String body = http.getString();
+      if (body.length() > 300) body = body.substring(0, 300) + "...";
+      Serial.printf("OSHA: API GET failed with code %d (%s)\n", code, err.c_str());
+      if (body.length() > 0) {
+        Serial.printf("OSHA: API error body: %s\n", body.c_str());
+      }
       http.end();
       return false;
     }
 
+    String payload = http.getString();
+    Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
     DynamicJsonDocument d(24576);
-    auto err = deserializeJson(d, http.getString());
+    auto err = deserializeJson(d, payload);
     http.end();
     if (err) {
       Serial.printf("OSHA: JSON parse failed: %s\n", err.c_str());
