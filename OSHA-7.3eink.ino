@@ -252,6 +252,7 @@ void handleSleepConfig();
 void handleShutdown();
 void handleUploadStream();
 void handleUploadDone();
+bool streamHtmlFromStorage(const char *path);
 
 // ================= SPI =================
 void SPI_Write(unsigned char value) {
@@ -795,11 +796,7 @@ void handleRoot() {
   }
 
   if (isAPMode) {
-    // Try to serve from LittleFS first
-    if (LittleFS.exists("/ap.html")) {
-      File file = LittleFS.open("/ap.html", "r");
-      server.streamFile(file, "text/html");
-      file.close();
+    if (streamHtmlFromStorage("/ap.html")) {
       return;
     }
     // Fallback minimal HTML
@@ -814,11 +811,7 @@ void handleRoot() {
     return;
   }
 
-  // Try to serve from LittleFS
-  if (LittleFS.exists("/ui.html")) {
-    File file = LittleFS.open("/ui.html", "r");
-    server.streamFile(file, "text/html");
-    file.close();
+  if (streamHtmlFromStorage("/ui.html")) {
     return;
   }
 
@@ -829,6 +822,28 @@ void handleRoot() {
     "<p><a href='/status'>Status JSON</a></p>"
     "<p><a href='/wifi'>WiFi settings</a></p>"
     "</body></html>");
+}
+
+bool streamHtmlFromStorage(const char *path) {
+  if (sdMounted && SD.exists(path)) {
+    File file = SD.open(path, "r");
+    if (file) {
+      server.streamFile(file, "text/html");
+      file.close();
+      return true;
+    }
+  }
+
+  if (LittleFS.exists(path)) {
+    File file = LittleFS.open(path, "r");
+    if (file) {
+      server.streamFile(file, "text/html");
+      file.close();
+      return true;
+    }
+  }
+
+  return false;
 }
 
 void handleUi() {
