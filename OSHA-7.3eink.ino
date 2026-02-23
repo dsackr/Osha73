@@ -813,6 +813,9 @@ void handleRoot() {
   }
 
   if (isAPMode) {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
     if (streamHtmlFromStorage("/ap.html")) {
       return;
     }
@@ -828,6 +831,9 @@ void handleRoot() {
     return;
   }
 
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
   if (streamHtmlFromStorage("/ui.html")) {
     return;
   }
@@ -842,6 +848,18 @@ void handleRoot() {
 }
 
 bool streamHtmlFromStorage(const char *path) {
+  String requestPath(path);
+  bool preferLittleFs = (requestPath == "/ui.html" || requestPath == "/ap.html");
+
+  if (preferLittleFs && LittleFS.exists(path)) {
+    File file = LittleFS.open(path, "r");
+    if (file) {
+      server.streamFile(file, "text/html");
+      file.close();
+      return true;
+    }
+  }
+
   if (sdMounted && SD.exists(path)) {
     File file = SD.open(path, "r");
     if (file) {
@@ -851,7 +869,7 @@ bool streamHtmlFromStorage(const char *path) {
     }
   }
 
-  if (LittleFS.exists(path)) {
+  if (!preferLittleFs && LittleFS.exists(path)) {
     File file = LittleFS.open(path, "r");
     if (file) {
       server.streamFile(file, "text/html");
