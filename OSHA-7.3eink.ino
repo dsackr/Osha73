@@ -600,6 +600,10 @@ bool downloadFileToSd(const char *url, const char *destPath) {
   const unsigned long STALL_TIMEOUT_MS = 15000;
 
   while (http.connected()) {
+    if (expectedLength > 0 && (int)totalWritten >= expectedLength) {
+      break;
+    }
+
     int avail = stream->available();
     if (avail <= 0) {
       unsigned long now = millis();
@@ -639,6 +643,15 @@ bool downloadFileToSd(const char *url, const char *destPath) {
       }
       lastProgressLog = now;
     }
+  }
+
+  if (expectedLength > 0 && (int)totalWritten != expectedLength) {
+    logSdSetup("download size mismatch for %s (expected=%d, got=%u)",
+               destPath, expectedLength, (unsigned int)totalWritten);
+    out.close();
+    SD.remove(destPath);
+    http.end();
+    return false;
   }
 
   if (!out) {
