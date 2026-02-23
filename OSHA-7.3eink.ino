@@ -1,19 +1,19 @@
-/***************************************************************************************
+/*/***************************************************************************************
  * ESP32-C6 + 7.3" 6-color E-Paper (800x480)
- * VERSION: LittleFS - HTML files stored in flash
+ * VERSION: SD-backed gallery and OSHA counter, LittleFS fallback for UI
  *
  * SETUP INSTRUCTIONS:
- * 1. Install "ESP32 Sketch Data Upload" plugin for Arduino IDE 2.x
- * 2. Create a folder called "data" next to this .ino file
- * 3. Place ap.html and ui.html in the data folder
- * 4. Upload sketch
- * 5. Use Tools -> ESP32 Sketch Data Upload to upload the HTML files
+ * 1. Insert a FAT32-formatted micro SD card and ensure it has at least a few megabytes of free space.
+ * 2. On first boot with Wi-Fi configured, the firmware will automatically download the default UI (ui.html and ap.html) and background assets to the SD card if they are missing.
+ * 3. Optionally, you can still use the “ESP32 Sketch Data Upload” plugin to upload ui.html and ap.html into LittleFS by placing them in a `data` folder next to this .ino file and running the upload tool.
+ * 4. Upload the sketch using a partition scheme with at least 2 MB of flash for the application (e.g. “No OTA” or “Huge APP”) to accommodate the firmware size.
  *
- * CHANGES IN THIS VERSION:
- * - Add /wifi page to reconfigure WiFi in BOTH STA + AP mode
- * - Add /wifi/clear to forget saved WiFi and reboot into AP mode
- * - Log mode + IP address to Serial on boot
- ***************************************************************************************/
+ * FEATURES IN THIS VERSION:
+ * - On-device OSHA incident mode with secure NVS storage of the API token and SD-backed configuration.
+ * - SD-backed image gallery with client-side thumbnail generation and asynchronous display refresh.
+ * - Automatic SD card setup for /gallery and /osha directories, background image storage, and layout
+ * - Wi-Fi STA + AP configuration pages with reconnect/clear options, deep sleep scheduling, and battery overlay.
+  ***************************************************************************************/
 
 #include <WiFi.h>
 #include <WebServer.h>
