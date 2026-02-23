@@ -127,8 +127,16 @@ function logInfo(m){infoEl.textContent=m;}
 
 var msLeft=0;
 var lastTick=Date.now();
+var statusPollTimer=null;
+var sessionPollTimer=null;
+var statusPollInFlight=false;
+var sessionPollInFlight=false;
+var STATUS_POLL_MS=15000;
+var SESSION_POLL_MS=10000;
 
 async function fetchStatus(){
+  if(statusPollInFlight) return;
+  statusPollInFlight=true;
   try{
     var res=await fetch('/status');
     var d=await res.json();
@@ -162,16 +170,30 @@ async function fetchStatus(){
     }
   }catch(e){
     logInfo('Unable to load status');
+  }finally{
+    statusPollInFlight=false;
   }
 }
 
 async function fetchSession(){
+  if(sessionPollInFlight) return;
+  sessionPollInFlight=true;
   try{
     var res=await fetch('/session');
     var d=await res.json();
     msLeft = d.ms_left || 0;
     lastTick = Date.now();
   }catch(e){}
+  finally{
+    sessionPollInFlight=false;
+  }
+}
+
+function schedulePolling(){
+  if(statusPollTimer) clearInterval(statusPollTimer);
+  if(sessionPollTimer) clearInterval(sessionPollTimer);
+  statusPollTimer=setInterval(fetchStatus, STATUS_POLL_MS);
+  sessionPollTimer=setInterval(fetchSession, SESSION_POLL_MS);
 }
 
 setInterval(function(){
@@ -556,6 +578,7 @@ galleryUploadHQBtn.onclick = async function(){
 fetchStatus();
 fetchSession();
 refreshGallery();
+schedulePolling();
 </script>
 </div>
 </body>
