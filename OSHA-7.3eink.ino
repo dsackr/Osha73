@@ -1358,7 +1358,9 @@ bool fetchOshaState(OshaState &stateOut) {
     secureClient.setInsecure();
 
     HTTPClient http;
-    http.setTimeout(12000);
+    http.useHTTP10(true);
+    http.setConnectTimeout(15000);
+    http.setTimeout(30000);
     Serial.printf("OSHA: fetching incidents from %s\n", url.c_str());
     if (!http.begin(secureClient, url)) {
       Serial.println("OSHA: failed to start HTTPS client");
@@ -1381,8 +1383,24 @@ bool fetchOshaState(OshaState &stateOut) {
 
     String payload = http.getString();
     Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
-    DynamicJsonDocument d(24576);
-    auto err = deserializeJson(d, payload);
+    if (payload.length() == 0) {
+      Serial.println("OSHA: API returned empty payload");
+      http.end();
+      return false;
+    }
+
+    StaticJsonDocument<1024> filter;
+    filter["incidents"][0]["id"] = true;
+    filter["incidents"][0]["incident_date"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["custom_field"]["name"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["value_catalog_entry"]["label"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["value"]["label"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["value"] = true;
+    filter["pagination"]["next_cursor"] = true;
+    filter["next_cursor"] = true;
+
+    DynamicJsonDocument d(32768);
+    auto err = deserializeJson(d, payload, DeserializationOption::Filter(filter));
     http.end();
     if (err) {
       Serial.printf("OSHA: JSON parse failed: %s\n", err.c_str());
