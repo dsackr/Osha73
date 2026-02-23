@@ -183,8 +183,6 @@ setInterval(function(){
   timerEl.textContent = 'Wi-Fi window: '+mm+':'+ss+' remaining';
 }, 250);
 
-setInterval(fetchStatus, 2000);
-setInterval(fetchSession, 2000);
 
 extendBtn.onclick = async function(){
   await fetch('/extend?minutes=5', {method:'POST'});
