@@ -42,7 +42,7 @@
 #define NEOPIXEL_PIN 23
 #define STATUS_LED_PIN 8  // SparkFun ESP32-C6 status LED (if present)
 
-const int SD_CS_PIN = -1;
+const int SD_CS_PIN = 18;  // SparkFun ESP32-C6 Thing Plus micro-SD CS pin
 
 // ================= Display =================
 #define EPD_WIDTH   800
@@ -539,7 +539,7 @@ bool ensureDirectory(const char *path) {
 }
 
 bool sdCardNeedsSetup() {
-  if (!sdMounted) return false;
+  if (!sdMounted) return true;
 
   if (!SD.exists("/gallery")) return true;
   if (!SD.exists("/gallery/.thumbs")) return true;
@@ -1668,7 +1668,12 @@ void setup() {
     Serial.println("LittleFS mounted successfully");
   }
 
-  sdMounted = (SD_CS_PIN >= 0) ? SD.begin(SD_CS_PIN) : SD.begin();
+  sdMounted = SD.begin(SD_CS_PIN);
+  if (!sdMounted) {
+    Serial.println("SD card mount failed; check card and wiring");
+  } else {
+    Serial.println("SD card mounted successfully");
+  }
   setenv("TZ", "EST5EDT", 1);
   tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
