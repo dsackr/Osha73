@@ -455,12 +455,21 @@ saveOshaBtn.onclick = async function(){
 
 refreshOshaBtn.onclick = async function(){
   logStatus('Refreshing OSHA...');
-  var res = await fetch('/osha/refresh', { method:'POST' });
-  if(res.ok){
-    logStatus('OSHA refreshed');
-    await fetchStatus();
-  }else{
-    logStatus('OSHA refresh failed');
+  try{
+    var res = await fetch('/osha/refresh', { method:'POST' });
+    var payload = {};
+    try{ payload = await res.json(); }catch(e){}
+    if(res.ok){
+      logStatus('OSHA refreshed and display updated');
+      await fetchStatus();
+    }else{
+      var msg = payload.error || ('HTTP '+res.status);
+      logStatus('OSHA refresh failed: '+msg);
+      alert('OSHA refresh failed: '+msg+'\n\nCheck the serial monitor logs for details.');
+    }
+  }catch(e){
+    logStatus('OSHA refresh request failed');
+    alert('OSHA refresh request failed. Check Wi-Fi connection and try again.');
   }
 };
 
