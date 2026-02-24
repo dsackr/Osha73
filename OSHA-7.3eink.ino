@@ -222,6 +222,8 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
                              unsigned long idleTimeoutMs, unsigned long hardTimeoutMs,
                              bool &completeOut, size_t &bytesReadTotalOut,
                              bool &bodyBufferedCompleteOut);
+bool decodeChunkedBodyForTest(const String &encoded, String &decodedOut);
+void runHttpBodyParserSelfTest();
 String escapedPreview(const String &input, size_t maxLen);
 void logHttpResponseMeta(const String &url, HTTPClient &http, int code, const String &readMode,
                          unsigned long startedAt, unsigned long firstByteAt, bool tlsInsecure);
@@ -774,6 +776,7 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
                              unsigned long idleTimeoutMs, unsigned long hardTimeoutMs,
                              bool &completeOut, size_t &bytesReadTotalOut,
                              bool &bodyBufferedCompleteOut) {
+  static const size_t HTTP_BODY_MAX_BUFFER = 64 * 1024;
   WiFiClient *stream = http.getStreamPtr();
   if (!stream) return false;
 
@@ -782,11 +785,19 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
   bodyBufferedCompleteOut = true;
   bodyOut = "";
   int expectedLength = http.getSize();
-  if (expectedLength > 0) bodyOut.reserve((size_t)expectedLength + 1);
+  bool hasContentLength = expectedLength >= 0;
+  size_t contentLength = hasContentLength ? (size_t)expectedLength : 0;
+  if (hasContentLength && contentLength <= HTTP_BODY_MAX_BUFFER) {
+    bodyOut.reserve(contentLength + 1);
+  }
 
   String transferEncoding = http.header("Transfer-Encoding");
   transferEncoding.toLowerCase();
   bool chunked = transferEncoding.indexOf("chunked") >= 0;
+  Serial.printf("OSHA: body parser framing parsed content_length=%d is_chunked=%d\n",
+                expectedLength, chunked ? 1 : 0);
+  appendDeviceLog("OSHA parser framing: content_length=%d chunked=%d",
+                  expectedLength, chunked ? 1 : 0);
 
   File out;
   if (sdMounted && sdPath && sdPath[0]) {
@@ -799,6 +810,8 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
   unsigned long startedAt = lastDataAt;
   uint8_t buf[1024];
   size_t contentBytesRead = 0;
+  size_t nextProgressLogAt = 8192;
+  String exitReason = "connection-close";
 
   enum ChunkState {
     CHUNK_SIZE,
@@ -812,11 +825,21 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
   String chunkLine = "";
 
   auto writeDecoded = [&](uint8_t b) {
-    size_t prevLen = bodyOut.length();
-    bodyOut += (char)b;
-    if (bodyOut.length() != prevLen + 1) bodyBufferedCompleteOut = false;
+    if (bodyBufferedCompleteOut) {
+      if (bodyOut.length() < HTTP_BODY_MAX_BUFFER) {
+        size_t prevLen = bodyOut.length();
+        bodyOut += (char)b;
+        if (bodyOut.length() != prevLen + 1) bodyBufferedCompleteOut = false;
+      } else {
+        bodyBufferedCompleteOut = false;
+      }
+    }
     if (out) out.write(&b, 1);
     contentBytesRead++;
+    if (contentBytesRead >= nextProgressLogAt) {
+      Serial.printf("OSHA: body parser progress bytes_read=%u\n", (unsigned int)contentBytesRead);
+      nextProgressLogAt += 8192;
+    }
   };
 
   auto parseChunkSizeLine = [&](const String &line, size_t &sizeOut) -> bool {
@@ -842,16 +865,20 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
   while (http.connected() || stream->available() > 0) {
     unsigned long now = millis();
     if (hardTimeoutMs > 0 && now - startedAt > hardTimeoutMs) {
+      exitReason = "hard-timeout";
       if (out) out.close();
       bytesReadTotalOut = contentBytesRead;
+      appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
       return false;
     }
 
     int avail = stream->available();
     if (avail <= 0) {
       if (idleTimeoutMs > 0 && now - lastDataAt > idleTimeoutMs) {
+        exitReason = "idle-timeout";
         if (out) out.close();
         bytesReadTotalOut = contentBytesRead;
+        appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
         return false;
       }
       delay(2);
@@ -863,7 +890,22 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
 
     lastDataAt = millis();
     if (!chunked) {
-      for (int i = 0; i < n; i++) writeDecoded(buf[i]);
+      int bytesToConsume = n;
+      if (hasContentLength) {
+        size_t remaining = (contentBytesRead < contentLength) ? (contentLength - contentBytesRead) : 0;
+        bytesToConsume = min((size_t)n, remaining);
+      }
+      for (int i = 0; i < bytesToConsume; i++) writeDecoded(buf[i]);
+      if (hasContentLength && contentBytesRead >= contentLength) {
+        completeOut = (contentBytesRead == contentLength);
+        bytesReadTotalOut = contentBytesRead;
+        exitReason = completeOut ? "content-length-satisfied" : "content-length-overread";
+        if (out) out.close();
+        Serial.printf("OSHA: body parser exit reason=%s bytes_read=%u\n",
+                      exitReason.c_str(), (unsigned int)contentBytesRead);
+        appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
+        return completeOut;
+      }
       continue;
     }
 
@@ -873,8 +915,10 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
         if (c == '\n') {
           size_t parsed = 0;
           if (!parseChunkSizeLine(chunkLine, parsed)) {
+            exitReason = "chunk-size-parse-failed";
             if (out) out.close();
             bytesReadTotalOut = contentBytesRead;
+            appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
             return false;
           }
           chunkLine = "";
@@ -888,15 +932,19 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
         if (--chunkBytesRemaining == 0) chunkState = CHUNK_DATA_CR;
       } else if (chunkState == CHUNK_DATA_CR) {
         if (c != '\r') {
+          exitReason = "chunk-data-missing-cr";
           if (out) out.close();
           bytesReadTotalOut = contentBytesRead;
+          appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
           return false;
         }
         chunkState = CHUNK_DATA_LF;
       } else if (chunkState == CHUNK_DATA_LF) {
         if (c != '\n') {
+          exitReason = "chunk-data-missing-lf";
           if (out) out.close();
           bytesReadTotalOut = contentBytesRead;
+          appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
           return false;
         }
         chunkState = CHUNK_SIZE;
@@ -904,8 +952,12 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
         if (c == '\n') {
           if (chunkLine.length() == 0) {
             completeOut = true;
+            exitReason = "final-chunk";
             if (out) out.close();
             bytesReadTotalOut = contentBytesRead;
+            Serial.printf("OSHA: body parser exit reason=%s bytes_read=%u\n",
+                          exitReason.c_str(), (unsigned int)contentBytesRead);
+            appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
             return true;
           }
           chunkLine = "";
@@ -918,20 +970,58 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
 
   if (chunked) {
     completeOut = (chunkState == CHUNK_TRAILERS && chunkLine.length() == 0);
+    exitReason = completeOut ? "final-chunk" : "chunked-stream-ended-early";
   } else {
-    completeOut = true;
+    completeOut = hasContentLength ? (contentBytesRead == contentLength) : true;
+    exitReason = hasContentLength
+      ? (completeOut ? "content-length-satisfied" : "content-length-mismatch")
+      : "connection-close";
   }
 
-  if (expectedLength > 0 && contentBytesRead != (size_t)expectedLength) {
+  if (hasContentLength && contentBytesRead != contentLength) {
     if (out) out.close();
     bytesReadTotalOut = contentBytesRead;
+    appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
     return false;
   }
 
   if (out) out.close();
   bytesReadTotalOut = contentBytesRead;
+  Serial.printf("OSHA: body parser exit reason=%s bytes_read=%u\n",
+                exitReason.c_str(), (unsigned int)contentBytesRead);
+  appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
   if (chunked && !completeOut) return false;
   return true;
+}
+
+bool decodeChunkedBodyForTest(const String &encoded, String &decodedOut) {
+  decodedOut = "";
+  size_t pos = 0;
+  while (true) {
+    int lineEnd = encoded.indexOf("\r\n", pos);
+    if (lineEnd < 0) return false;
+    String sizeLine = encoded.substring(pos, lineEnd);
+    int semi = sizeLine.indexOf(';');
+    if (semi >= 0) sizeLine = sizeLine.substring(0, semi);
+    sizeLine.trim();
+    if (sizeLine.length() == 0) return false;
+    size_t chunkSize = strtoul(sizeLine.c_str(), nullptr, 16);
+    pos = (size_t)lineEnd + 2;
+    if (chunkSize == 0) return true;
+    if (pos + chunkSize + 2 > encoded.length()) return false;
+    decodedOut += encoded.substring(pos, pos + chunkSize);
+    pos += chunkSize;
+    if (!(encoded[pos] == '\r' && encoded[pos + 1] == '\n')) return false;
+    pos += 2;
+  }
+}
+
+void runHttpBodyParserSelfTest() {
+  const String fixed = "{\"incidents\":[],\"pagination_meta\":{\"page_size\":25,\"total_record_count\":0}}";
+  String chunkDecoded;
+  bool chunkOk = decodeChunkedBodyForTest("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", chunkDecoded);
+  Serial.printf("OSHA parser self-test fixed_len=%u chunk_ok=%d chunk_val=%s\n",
+                (unsigned int)fixed.length(), chunkOk ? 1 : 0, chunkDecoded.c_str());
 }
 
 String escapedPreview(const String &input, size_t maxLen) {
@@ -1805,6 +1895,7 @@ bool fetchOshaState(OshaState &stateOut) {
     String queryPrefix = url.indexOf('?') >= 0 ? "&" : "?";
     String fieldFilterKey = "custom_field[" + oshaSelfInflictedFieldId + "][one_of]";
     url += queryPrefix + urlEncodeComponent(fieldFilterKey) + "=" + urlEncodeComponent(oshaSelfInflictedOneOf);
+    if (url.indexOf("page_size=") < 0) url += "&page_size=25";
     if (cursor.length() > 0) url += "&cursor=" + urlEncodeComponent(cursor);
     int32_t freeHeapBefore = ESP.getFreeHeap();
     long rssi = WiFi.RSSI();
@@ -1827,6 +1918,7 @@ bool fetchOshaState(OshaState &stateOut) {
     http.addHeader("Authorization", "Bearer " + oshaToken);
     http.addHeader("Accept", "application/json");
     http.addHeader("Accept-Encoding", "identity");
+    http.addHeader("Connection", "close");
     const char *trackedHeaders[] = {"Content-Type", "Content-Length", "Transfer-Encoding", "Content-Encoding"};
     http.collectHeaders(trackedHeaders, 4);
     Serial.printf("OSHA: request headers Authorization=Bearer <redacted> Accept=application/json Accept-Encoding=identity\n");
@@ -1861,6 +1953,9 @@ bool fetchOshaState(OshaState &stateOut) {
     bool bodyComplete = false;
     size_t bytesReadTotal = 0;
     bool bodyBufferedComplete = false;
+    String transferEncoding = http.header("Transfer-Encoding");
+    transferEncoding.toLowerCase();
+    bool responseChunked = transferEncoding.indexOf("chunked") >= 0;
     if (!readHttpBodyWithTimeout(http, payload, "/cache/incidents.json", 20000, 90000,
                                  bodyComplete, bytesReadTotal, bodyBufferedComplete)) {
       Serial.printf("OSHA: API body read failed or timed out (bytes=%u complete=%d)\n",
@@ -1921,7 +2016,8 @@ bool fetchOshaState(OshaState &stateOut) {
     filter["next_cursor"] = true;
 
     File cachedPayload;
-    bool parseFromCacheFile = !bodyBufferedComplete && sdMounted && SD.exists("/cache/incidents.json");
+    bool parseFromCacheFile = sdMounted && SD.exists("/cache/incidents.json") &&
+                              (responseChunked || !bodyBufferedComplete || bytesReadTotal != payload.length());
     if (parseFromCacheFile) {
       cachedPayload = SD.open("/cache/incidents.json", FILE_READ);
       if (!cachedPayload) {
@@ -2474,6 +2570,7 @@ void shutdownForever() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  runHttpBodyParserSelfTest();
 
   // Initialize LittleFS for HTML files
   if (!LittleFS.begin(true)) {
