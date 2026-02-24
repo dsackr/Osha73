@@ -217,6 +217,10 @@ bool removeSdPathRecursive(const String &path);
 bool saveIncidentDebugFile(const String &name, const String &content);
 bool refreshDefaultUiFromGithub(String &errorOut);
 bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long stallTimeoutMs);
+String escapedPreview(const String &input, size_t maxLen);
+void logHttpResponseMeta(const String &url, HTTPClient &http, int code, const String &readMode,
+                         unsigned long startedAt, unsigned long firstByteAt, bool tlsInsecure);
+void persistParseFailureArtifacts(const String &payload, const String &reasonTag);
 
 void Epaper_Write_Data(unsigned char data);
 void Epaper_READBUSY(void);
@@ -775,6 +779,58 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long st
     return false;
   }
   return true;
+}
+
+String escapedPreview(const String &input, size_t maxLen) {
+  String out;
+  size_t lim = min(maxLen, input.length());
+  out.reserve(lim * 2 + 8);
+  for (size_t i = 0; i < lim; i++) {
+    const uint8_t c = (uint8_t)input[i];
+    if (c == '\\n') out += "\\n";
+    else if (c == '\\r') out += "\\r";
+    else if (c == '\\t') out += "\\t";
+    else if (c == '\\\\') out += "\\\\";
+    else if (c >= 32 && c <= 126) out += (char)c;
+    else {
+      char hexBuf[5];
+      snprintf(hexBuf, sizeof(hexBuf), "\\x%02X", c);
+      out += hexBuf;
+    }
+  }
+  if (input.length() > lim) out += "...";
+  return out;
+}
+
+void logHttpResponseMeta(const String &url, HTTPClient &http, int code, const String &readMode,
+                         unsigned long startedAt, unsigned long firstByteAt, bool tlsInsecure) {
+  String contentType = http.header("Content-Type");
+  String contentLen = http.header("Content-Length");
+  String transferEncoding = http.header("Transfer-Encoding");
+  String contentEncoding = http.header("Content-Encoding");
+  if (contentLen.length() == 0) contentLen = "<missing>";
+  if (transferEncoding.length() == 0) transferEncoding = "<missing>";
+  if (contentEncoding.length() == 0) contentEncoding = "<missing>";
+  unsigned long now = millis();
+  unsigned long ttfbMs = (firstByteAt >= startedAt) ? (firstByteAt - startedAt) : 0;
+  unsigned long totalMs = (now >= startedAt) ? (now - startedAt) : 0;
+  const char *verifyMode = tlsInsecure ? "insecure" : "ca";
+  const char *gzipState = contentEncoding.indexOf("gzip") >= 0 ? "yes" : "no";
+
+  Serial.printf("OSHA HTTP META: url=%s code=%d ct=%s cl=%s te=%s ce=%s gzip=%s read=%s ttfb_ms=%lu total_ms=%lu tls=%s\n",
+                url.c_str(), code, contentType.c_str(), contentLen.c_str(), transferEncoding.c_str(),
+                contentEncoding.c_str(), gzipState, readMode.c_str(), ttfbMs, totalMs, verifyMode);
+  appendDeviceLog("OSHA HTTP: code=%d ct=%s cl=%s te=%s ce=%s read=%s ttfb=%lu total=%lu tls=%s",
+                  code, contentType.c_str(), contentLen.c_str(), transferEncoding.c_str(),
+                  contentEncoding.c_str(), readMode.c_str(), ttfbMs, totalMs, verifyMode);
+}
+
+void persistParseFailureArtifacts(const String &payload, const String &reasonTag) {
+  saveIncidentDebugFile("incident-parse-error-raw.txt", payload);
+  String snippet = payload.substring(0, min((size_t)4096, payload.length()));
+  saveIncidentDebugFile("incident-parse-error-snippet.txt", snippet);
+  saveIncidentDebugFile("incident-parse-error-reason.txt", reasonTag);
+  Serial.printf("OSHA: parse failure body[0:256]=%s\n", escapedPreview(payload, 256).c_str());
 }
 
 bool configureSdCardDefaults(String &errorOut) {
@@ -1594,12 +1650,16 @@ bool fetchOshaState(OshaState &stateOut) {
   while (true) {
     String url = oshaBaseUrl;
     if (cursor.length() > 0) url += "?cursor=" + cursor;
+    int32_t freeHeapBefore = ESP.getFreeHeap();
+    long rssi = WiFi.RSSI();
+    Serial.printf("OSHA: request context heap_before=%ld rssi=%ld url=%s\n", (long)freeHeapBefore, rssi, url.c_str());
 
     WiFiClientSecure secureClient;
     secureClient.setInsecure();
+    const bool tlsInsecure = true;
 
     HTTPClient http;
-    http.useHTTP10(true);
+    http.useHTTP10(false);
     http.setConnectTimeout(15000);
     http.setTimeout(30000);
     Serial.printf("OSHA: fetching incidents from %s\n", url.c_str());
@@ -1610,37 +1670,75 @@ bool fetchOshaState(OshaState &stateOut) {
     }
     http.addHeader("Authorization", "Bearer " + oshaToken);
     http.addHeader("Accept", "application/json");
+    http.addHeader("Accept-Encoding", "identity");
+    const char *trackedHeaders[] = {"Content-Type", "Content-Length", "Transfer-Encoding", "Content-Encoding"};
+    http.collectHeaders(trackedHeaders, 4);
+    Serial.printf("OSHA: request headers Authorization=Bearer <redacted> Accept=application/json Accept-Encoding=identity\n");
+    unsigned long requestStartedAt = millis();
     int code = http.GET();
+    unsigned long firstByteAt = millis();
+    String readMode = "stream";
+    logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
     if (code != HTTP_CODE_OK) {
       String err = http.errorToString(code);
       String body = http.getString();
-      if (body.length() > 300) body = body.substring(0, 300) + "...";
+      readMode = "getString";
+      logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
+      String bodyPreview = body;
+      if (bodyPreview.length() > 300) bodyPreview = bodyPreview.substring(0, 300) + "...";
       Serial.printf("OSHA: API GET failed with code %d (%s)\n", code, err.c_str());
       appendDeviceLog("OSHA poll failed: HTTP %d (%s)", code, err.c_str());
       if (body.length() > 0) {
-        Serial.printf("OSHA: API error body: %s\n", body.c_str());
+        Serial.printf("OSHA: API error body: %s\n", bodyPreview.c_str());
         saveIncidentDebugFile("incident-last-error.txt", body);
       }
       http.end();
       return false;
     }
 
+    String contentType = http.header("Content-Type");
+    String lowerCt = contentType;
+    lowerCt.toLowerCase();
+
     String payload;
     if (!readHttpBodyWithTimeout(http, payload, 20000)) {
       Serial.println("OSHA: API body read failed or timed out");
       appendDeviceLog("OSHA poll failed: timed out reading API response body");
+      persistParseFailureArtifacts(payload, "read-timeout-or-truncated");
       http.end();
       return false;
     }
+    logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
     Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
     saveIncidentDebugFile("incident-last.json", payload);
+    Serial.printf("OSHA: body[0:256]=%s\n", escapedPreview(payload, 256).c_str());
     if (payload.length() == 0) {
       Serial.println("OSHA: API returned empty payload");
+      persistParseFailureArtifacts(payload, "empty-payload");
       http.end();
       return false;
     }
 
-    StaticJsonDocument<1024> filter;
+    if (!lowerCt.startsWith("application/json")) {
+      Serial.printf("OSHA: unexpected Content-Type for incidents payload: %s\n", contentType.c_str());
+      appendDeviceLog("OSHA poll failed: unexpected content-type %s", contentType.c_str());
+      persistParseFailureArtifacts(payload, "unexpected-content-type");
+      http.end();
+      return false;
+    }
+
+    String contentEncoding = http.header("Content-Encoding");
+    String lowerEncoding = contentEncoding;
+    lowerEncoding.toLowerCase();
+    if (lowerEncoding.indexOf("gzip") >= 0) {
+      Serial.printf("OSHA: gzip-encoded response not supported for JSON parse: %s\n", contentEncoding.c_str());
+      appendDeviceLog("OSHA poll failed: gzip content-encoding unsupported (%s)", contentEncoding.c_str());
+      persistParseFailureArtifacts(payload, "gzip-content-encoding");
+      http.end();
+      return false;
+    }
+
+    DynamicJsonDocument filter(1024);
     filter["incidents"][0]["id"] = true;
     filter["incidents"][0]["incident_date"] = true;
     filter["incidents"][0]["custom_field_entries"][0]["custom_field"]["name"] = true;
@@ -1650,13 +1748,16 @@ bool fetchOshaState(OshaState &stateOut) {
     filter["pagination"]["next_cursor"] = true;
     filter["next_cursor"] = true;
 
-    DynamicJsonDocument d(32768);
+    size_t docCapacity = max((size_t)4096, payload.length() / 2 + 4096);
+    DynamicJsonDocument d(docCapacity);
     auto err = deserializeJson(d, payload, DeserializationOption::Filter(filter));
     http.end();
     if (err) {
-      Serial.printf("OSHA: JSON parse failed: %s\n", err.c_str());
-      saveIncidentDebugFile("incident-parse-error.txt", payload);
-      appendDeviceLog("OSHA poll failed: JSON parse error %s", err.c_str());
+      Serial.printf("OSHA: JSON parse failed: %s (%d), parse_mode=String, doc_capacity=%u\n",
+                    err.c_str(), (int)err.code(), (unsigned int)docCapacity);
+      appendDeviceLog("OSHA poll failed: JSON parse error %s (%d) cap=%u mode=String",
+                      err.c_str(), (int)err.code(), (unsigned int)docCapacity);
+      persistParseFailureArtifacts(payload, "json-deserialize-failed");
       return false;
     }
 
@@ -1683,6 +1784,9 @@ bool fetchOshaState(OshaState &stateOut) {
     }
 
     String nextCursor = String((const char*)(d["pagination"]["next_cursor"] | d["next_cursor"] | ""));
+    int32_t freeHeapAfter = ESP.getFreeHeap();
+    Serial.printf("OSHA: request context heap_after=%ld rssi=%ld next_cursor_len=%u\n",
+                  (long)freeHeapAfter, rssi, (unsigned int)nextCursor.length());
     if (nextCursor.length() == 0) break;
     cursor = nextCursor;
   }
