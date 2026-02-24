@@ -207,6 +207,7 @@ void handleSdUploadStream();
 void handleSdUploadDone();
 void handleSdDelete();
 void handleSdMkdir();
+void handleUiRefresh();
 bool refreshOshaAndMaybeDisplay(bool forceDisplay);
 bool renderOshaDisplay(const OshaState &state);
 void processPendingDisplayRefresh();
@@ -214,6 +215,8 @@ void appendDeviceLog(const char *fmt, ...);
 bool sanitizeSdPath(const String &input, String &outPath);
 bool removeSdPathRecursive(const String &path);
 bool saveIncidentDebugFile(const String &name, const String &content);
+bool refreshDefaultUiFromGithub(String &errorOut);
+bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long stallTimeoutMs);
 
 void Epaper_Write_Data(unsigned char data);
 void Epaper_READBUSY(void);
@@ -715,6 +718,62 @@ bool downloadFileToSd(const char *url, const char *destPath) {
   http.end();
   logSdSetup("download complete %s (%u bytes in %lu ms)",
              destPath, (unsigned int)totalWritten, millis() - startedAt);
+  return true;
+}
+
+bool refreshDefaultUiFromGithub(String &errorOut) {
+  if (!sdMounted) {
+    errorOut = "sd unavailable";
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    errorOut = "wifi not connected";
+    return false;
+  }
+
+  if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ui.html", "/ui.html")) {
+    errorOut = "failed to download /ui.html";
+    return false;
+  }
+  if (!downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ap.html", "/ap.html")) {
+    errorOut = "failed to download /ap.html";
+    return false;
+  }
+  errorOut = "";
+  return true;
+}
+
+bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long stallTimeoutMs) {
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream) return false;
+
+  bodyOut = "";
+  int expectedLength = http.getSize();
+  if (expectedLength > 0) bodyOut.reserve((size_t)expectedLength + 1);
+
+  unsigned long lastDataAt = millis();
+  uint8_t buf[1024];
+
+  while (http.connected() || stream->available() > 0) {
+    int avail = stream->available();
+    if (avail <= 0) {
+      if (millis() - lastDataAt > stallTimeoutMs) {
+        return false;
+      }
+      delay(2);
+      continue;
+    }
+
+    int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
+    if (n <= 0) continue;
+
+    bodyOut.concat((const char*)buf, (size_t)n);
+    lastDataAt = millis();
+  }
+
+  if (expectedLength > 0 && bodyOut.length() != (size_t)expectedLength) {
+    return false;
+  }
   return true;
 }
 
@@ -1566,7 +1625,13 @@ bool fetchOshaState(OshaState &stateOut) {
       return false;
     }
 
-    String payload = http.getString();
+    String payload;
+    if (!readHttpBodyWithTimeout(http, payload, 20000)) {
+      Serial.println("OSHA: API body read failed or timed out");
+      appendDeviceLog("OSHA poll failed: timed out reading API response body");
+      http.end();
+      return false;
+    }
     Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
     saveIncidentDebugFile("incident-last.json", payload);
     if (payload.length() == 0) {
@@ -1823,6 +1888,22 @@ void handleOshaRefresh() {
   server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
+void handleUiRefresh() {
+  logWebRequest("handleUiRefresh");
+  String error;
+  if (!refreshDefaultUiFromGithub(error)) {
+    Serial.printf("WEB: UI refresh failed: %s\n", error.c_str());
+    appendDeviceLog("UI refresh failed: %s", error.c_str());
+    String response = String("{\"error\":\"") + error + "\"}";
+    server.send(500, "application/json", response);
+    return;
+  }
+
+  Serial.println("WEB: UI refresh complete");
+  appendDeviceLog("UI refresh complete: /ui.html and /ap.html updated from GitHub");
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
 void handleImagesUploadStream() {
   if (server.upload().status == UPLOAD_FILE_START) {
     logWebRequest("handleImagesUploadStream:UPLOAD_FILE_START");
@@ -2058,6 +2139,7 @@ void setupWebServer() {
   server.on("/sd/mkdir", HTTP_POST, handleSdMkdir);
   server.on("/osha/config", HTTP_POST, handleOshaConfig);
   server.on("/osha/refresh", HTTP_POST, handleOshaRefresh);
+  server.on("/ui/refresh", HTTP_POST, handleUiRefresh);
 
   server.onNotFound([]() {
     server.sendHeader("Location", "/", true);
