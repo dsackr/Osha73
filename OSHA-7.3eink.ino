@@ -33,6 +33,8 @@
 #include <algorithm>
 #include <time.h>
 
+#define DEVICE_LOG_PATH "/osha/device.log"
+
 // ================= Pins =================
 #define BUSY_Pin  3
 #define RES_Pin   4
@@ -199,9 +201,19 @@ void handleImagesDelete();
 void handleDisplayShow();
 void handleOshaRefresh();
 void handleOshaConfig();
+void handleLogs();
+void handleSdList();
+void handleSdUploadStream();
+void handleSdUploadDone();
+void handleSdDelete();
+void handleSdMkdir();
 bool refreshOshaAndMaybeDisplay(bool forceDisplay);
 bool renderOshaDisplay(const OshaState &state);
 void processPendingDisplayRefresh();
+void appendDeviceLog(const char *fmt, ...);
+bool sanitizeSdPath(const String &input, String &outPath);
+bool removeSdPathRecursive(const String &path);
+bool saveIncidentDebugFile(const String &name, const String &content);
 
 void Epaper_Write_Data(unsigned char data);
 void Epaper_READBUSY(void);
@@ -268,6 +280,26 @@ void logWebRequest(const char *handlerName) {
     default: break;
   }
   Serial.printf("WEB: %s [%s %s] from %s\n", handlerName, method, uri.c_str(), remote.c_str());
+}
+
+void appendDeviceLog(const char *fmt, ...) {
+  char message[384];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(message, sizeof(message), fmt, args);
+  va_end(args);
+
+  Serial.printf("LOG: %s\n", message);
+  if (!sdMounted) return;
+  if (!SD.exists("/osha")) SD.mkdir("/osha");
+
+  File f = SD.open(DEVICE_LOG_PATH, FILE_APPEND);
+  if (!f) f = SD.open(DEVICE_LOG_PATH, FILE_WRITE);
+  if (!f) return;
+
+  unsigned long s = millis() / 1000UL;
+  f.printf("[%lu] %s\n", s, message);
+  f.close();
 }
 
 // ================= SPI =================
@@ -805,7 +837,6 @@ void setupWiFi(void) {
 
 // ================= Web handlers =================
 void handleRoot() {
-  logWebRequest("handleRoot");
   if (!isAPMode && sdSetupRequired) {
     server.sendHeader("Location", "/sd/setup", true);
     server.send(302, "text/plain", "");
@@ -882,7 +913,6 @@ bool streamHtmlFromStorage(const char *path) {
 }
 
 void handleUi() {
-  logWebRequest("handleUi");
   if (!isAPMode && sdSetupRequired) {
     server.sendHeader("Location", "/sd/setup", true);
     server.send(302, "text/plain", "");
@@ -950,6 +980,7 @@ void handleSaveWiFi() {
   preferences.putString("ssid", ssid);
   preferences.putString("password", pass);
   preferences.end();
+  appendDeviceLog("WiFi credentials updated for SSID: %s", ssid.c_str());
 
   server.send(200, "text/html",
     "<html><body><h3>Saved.</h3><p>Restarting...</p></body></html>");
@@ -964,6 +995,7 @@ void handleClearWiFi() {
   preferences.remove("ssid");
   preferences.remove("password");
   preferences.end();
+  appendDeviceLog("WiFi credentials cleared");
 
   server.send(200, "text/html",
     "<html><body><h3>WiFi cleared.</h3><p>Restarting into AP mode...</p></body></html>");
@@ -1005,8 +1037,140 @@ void handleWifiPage() {
   server.send(200, "text/html", html);
 }
 
+bool sanitizeSdPath(const String &input, String &outPath) {
+  String p = input;
+  p.trim();
+  if (p.length() == 0) p = "/";
+  if (!p.startsWith("/")) p = "/" + p;
+  while (p.indexOf("//") >= 0) p.replace("//", "/");
+  if (p.indexOf("..") >= 0) return false;
+  outPath = p;
+  return true;
+}
+
+bool removeSdPathRecursive(const String &path) {
+  if (!SD.exists(path.c_str())) return true;
+  File node = SD.open(path.c_str(), FILE_READ);
+  if (!node) return false;
+  bool isDir = node.isDirectory();
+  node.close();
+  if (!isDir) return SD.remove(path.c_str());
+
+  File dir = SD.open(path.c_str(), FILE_READ);
+  if (!dir) return false;
+  while (true) {
+    File child = dir.openNextFile();
+    if (!child) break;
+    String childPath = String(child.name());
+    bool childIsDir = child.isDirectory();
+    child.close();
+    if (childIsDir) {
+      if (!removeSdPathRecursive(childPath)) { dir.close(); return false; }
+    } else {
+      if (!SD.remove(childPath.c_str())) { dir.close(); return false; }
+    }
+  }
+  dir.close();
+  return SD.rmdir(path.c_str());
+}
+
+void handleLogs() {
+  if (!sdMounted || !SD.exists(DEVICE_LOG_PATH)) {
+    server.send(200, "text/plain", "No logs yet.\n");
+    return;
+  }
+  File f = SD.open(DEVICE_LOG_PATH, FILE_READ);
+  if (!f) { server.send(500, "text/plain", "Unable to open log file\n"); return; }
+  server.streamFile(f, "text/plain");
+  f.close();
+}
+
+void handleSdList() {
+  if (!sdMounted) { server.send(500, "application/json", "{\"error\":\"sd unavailable\"}"); return; }
+  String path;
+  if (!sanitizeSdPath(server.hasArg("path") ? server.arg("path") : "/", path)) {
+    server.send(400, "application/json", "{\"error\":\"invalid path\"}");
+    return;
+  }
+  File dir = SD.open(path.c_str(), FILE_READ);
+  if (!dir || !dir.isDirectory()) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+  DynamicJsonDocument d(16384);
+  JsonArray arr = d.createNestedArray("entries");
+  while (true) {
+    File e = dir.openNextFile();
+    if (!e) break;
+    JsonObject item = arr.createNestedObject();
+    String full = String(e.name());
+    String name = full;
+    int slash = full.lastIndexOf('/');
+    if (slash >= 0) name = full.substring(slash + 1);
+    item["name"] = name;
+    item["path"] = full;
+    item["is_dir"] = e.isDirectory();
+    item["size"] = (uint32_t)e.size();
+    e.close();
+  }
+  dir.close();
+  d["path"] = path;
+  String out;
+  serializeJson(d, out);
+  server.send(200, "application/json", out);
+}
+
+String sdUploadTargetPath = "";
+File sdUploadFile;
+
+void handleSdUploadStream() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    if (!sdMounted) return;
+    String base;
+    if (!sanitizeSdPath(server.hasArg("path") ? server.arg("path") : "/", base)) return;
+    if (!base.endsWith("/")) base += "/";
+    String name = sanitizeFileName(up.filename);
+    sdUploadTargetPath = base + name;
+    if (sdUploadFile) sdUploadFile.close();
+    sdUploadFile = SD.open(sdUploadTargetPath.c_str(), FILE_WRITE);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (sdUploadFile) sdUploadFile.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+    if (sdUploadFile) sdUploadFile.close();
+  }
+}
+
+void handleSdUploadDone() {
+  if (!sdMounted) { server.send(500, "application/json", "{\"error\":\"sd unavailable\"}"); return; }
+  if (sdUploadTargetPath.length() == 0) { server.send(400, "application/json", "{\"error\":\"upload failed\"}"); return; }
+  appendDeviceLog("SD upload: %s", sdUploadTargetPath.c_str());
+  String out = String("{\"status\":\"ok\",\"path\":\"") + sdUploadTargetPath + "\"}";
+  server.send(200, "application/json", out);
+  sdUploadTargetPath = "";
+}
+
+void handleSdDelete() {
+  if (!sdMounted || !server.hasArg("path")) { server.send(400, "application/json", "{\"error\":\"missing path\"}"); return; }
+  String path;
+  if (!sanitizeSdPath(server.arg("path"), path) || path == "/") { server.send(400, "application/json", "{\"error\":\"invalid path\"}"); return; }
+  if (!SD.exists(path.c_str())) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+  bool ok = removeSdPathRecursive(path);
+  if (!ok) { server.send(500, "application/json", "{\"error\":\"delete failed\"}"); return; }
+  appendDeviceLog("SD delete: %s", path.c_str());
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleSdMkdir() {
+  if (!sdMounted || !server.hasArg("path")) { server.send(400, "application/json", "{\"error\":\"missing path\"}"); return; }
+  String path;
+  if (!sanitizeSdPath(server.arg("path"), path) || path == "/") { server.send(400, "application/json", "{\"error\":\"invalid path\"}"); return; }
+  if (SD.exists(path.c_str()) || SD.mkdir(path.c_str())) {
+    appendDeviceLog("SD mkdir: %s", path.c_str());
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+    return;
+  }
+  server.send(500, "application/json", "{\"error\":\"mkdir failed\"}");
+}
+
 void handleStatus() {
-  logWebRequest("handleStatus");
   float v = batteryVoltage();
   float soc = batterySOC();
   float crate = batteryCRatePctPerHour();
@@ -1044,7 +1208,6 @@ void handleStatus() {
 }
 
 void handleSession() {
-  logWebRequest("handleSession");
   if (isAPMode) { server.send(200, "application/json", "{\"ms_left\":0,\"ap_mode\":true}"); return; }
   int32_t msLeft = (int32_t)(sessionEndMs - millis());
   if (msLeft < 0) msLeft = 0;
@@ -1061,6 +1224,7 @@ void handleExtend() {
   uint32_t newEnd = max(sessionEndMs, now) + (uint32_t)addMin * 60UL * 1000UL;
   uint32_t maxEnd = now + MAX_WINDOW_MS;
   sessionEndMs = min(newEnd, maxEnd);
+  appendDeviceLog("Session extended by %d minute(s)", addMin);
 
   server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
@@ -1073,6 +1237,7 @@ void handlePullUrl() {
   preferences.begin("epaper", false);
   preferences.putString("pullurl", pullUrl);
   preferences.end();
+  appendDeviceLog("Pull URL updated to %s", pullUrl.c_str());
   server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -1095,11 +1260,13 @@ void handleSleepConfig() {
   preferences.begin("epaper", false);
   preferences.putUInt("sleepHours", sleepHours);
   preferences.end();
+  appendDeviceLog("Sleep interval updated to %d hour(s)", hours);
   server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 void handleShutdown() {
   logWebRequest("handleShutdown");
+  appendDeviceLog("Manual shutdown requested from UI");
   server.send(200, "text/plain", "Shutting down");
   delay(150);
   shutdownForever();
@@ -1170,6 +1337,7 @@ void handleUploadDone() {
   if (currentImageFile) currentImageFile.close();
 
   setOshaModeEnabled(false);
+  appendDeviceLog("Manual override image uploaded and displayed");
   Serial.println("WEB: Display upload complete; picture mode enabled and refresh queued");
   uploadInProgress = false;
   pendingDisplayRefresh = true;
@@ -1334,17 +1502,31 @@ bool saveOshaStateToSd(const OshaState &state) {
   return true;
 }
 
+bool saveIncidentDebugFile(const String &name, const String &content) {
+  if (!sdMounted) return false;
+  if (!SD.exists("/osha")) SD.mkdir("/osha");
+  String path = "/osha/" + name;
+  File f = SD.open(path.c_str(), FILE_WRITE);
+  if (!f) return false;
+  f.print(content);
+  f.close();
+  return true;
+}
+
 bool fetchOshaState(OshaState &stateOut) {
   if (!oshaEnabled) {
     Serial.println("OSHA: fetch skipped; OSHA mode disabled");
+    appendDeviceLog("OSHA poll skipped: mode disabled");
     return false;
   }
   if (oshaToken.length() == 0) {
     Serial.println("OSHA: fetch skipped; missing token");
+    appendDeviceLog("OSHA poll skipped: token missing");
     return false;
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("OSHA: fetch skipped; WiFi not connected");
+    appendDeviceLog("OSHA poll skipped: WiFi disconnected");
     return false;
   }
   std::vector<std::pair<time_t, String>> offenses;
@@ -1364,6 +1546,7 @@ bool fetchOshaState(OshaState &stateOut) {
     Serial.printf("OSHA: fetching incidents from %s\n", url.c_str());
     if (!http.begin(secureClient, url)) {
       Serial.println("OSHA: failed to start HTTPS client");
+      appendDeviceLog("OSHA poll failed: HTTPS begin failed");
       return false;
     }
     http.addHeader("Authorization", "Bearer " + oshaToken);
@@ -1374,8 +1557,10 @@ bool fetchOshaState(OshaState &stateOut) {
       String body = http.getString();
       if (body.length() > 300) body = body.substring(0, 300) + "...";
       Serial.printf("OSHA: API GET failed with code %d (%s)\n", code, err.c_str());
+      appendDeviceLog("OSHA poll failed: HTTP %d (%s)", code, err.c_str());
       if (body.length() > 0) {
         Serial.printf("OSHA: API error body: %s\n", body.c_str());
+        saveIncidentDebugFile("incident-last-error.txt", body);
       }
       http.end();
       return false;
@@ -1383,6 +1568,7 @@ bool fetchOshaState(OshaState &stateOut) {
 
     String payload = http.getString();
     Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
+    saveIncidentDebugFile("incident-last.json", payload);
     if (payload.length() == 0) {
       Serial.println("OSHA: API returned empty payload");
       http.end();
@@ -1404,6 +1590,8 @@ bool fetchOshaState(OshaState &stateOut) {
     http.end();
     if (err) {
       Serial.printf("OSHA: JSON parse failed: %s\n", err.c_str());
+      saveIncidentDebugFile("incident-parse-error.txt", payload);
+      appendDeviceLog("OSHA poll failed: JSON parse error %s", err.c_str());
       return false;
     }
 
@@ -1436,6 +1624,7 @@ bool fetchOshaState(OshaState &stateOut) {
 
   if (offenses.empty()) {
     Serial.println("OSHA: no qualifying offenses found");
+    appendDeviceLog("OSHA poll success: no qualifying offenses");
     stateOut = {0,0,"","",""};
     return true;
   }
@@ -1561,6 +1750,7 @@ bool renderOshaDisplay(const OshaState &state) {
 
 bool refreshOshaAndMaybeDisplay(bool forceDisplay) {
   Serial.printf("OSHA: refresh started (forceDisplay=%s)\n", forceDisplay ? "true" : "false");
+  appendDeviceLog("OSHA refresh started (forceDisplay=%s)", forceDisplay ? "true" : "false");
   OshaState fetched;
   if (!fetchOshaState(fetched)) {
     Serial.println("OSHA: refresh failed while fetching state");
@@ -1588,6 +1778,7 @@ bool refreshOshaAndMaybeDisplay(bool forceDisplay) {
   oshaDate = fetched.date;
   oshaReason = fetched.reason;
   Serial.println("OSHA: refresh complete");
+  appendDeviceLog("OSHA refresh complete: days=%d prior=%d incident=%s", fetched.days, fetched.prior, fetched.incident.c_str());
   return true;
 }
 
@@ -1601,6 +1792,7 @@ void handleOshaConfig() {
     oshaToken = server.arg("token");
     preferences.putString("osha_token", oshaToken);
     Serial.println("WEB: OSHA token updated");
+    appendDeviceLog("OSHA API token updated");
   }
   if (enablingOsha && sleepHours > 24) {
     sleepHours = 24;
@@ -1609,6 +1801,7 @@ void handleOshaConfig() {
   preferences.putString("osha_url", oshaBaseUrl);
   preferences.end();
   Serial.printf("WEB: OSHA mode %s, sleepHours=%u\n", oshaEnabled ? "enabled" : "disabled", sleepHours);
+  appendDeviceLog("OSHA mode set to %s", oshaEnabled ? "enabled" : "disabled");
   server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -1844,6 +2037,7 @@ void setupWebServer() {
   server.on("/wifi/clear", HTTP_POST, handleClearWiFi);
 
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/logs", HTTP_GET, handleLogs);
   server.on("/sd/setup", HTTP_GET, handleSdSetupPage);
   server.on("/sd/setup/run", HTTP_POST, handleSdSetupRun);
   server.on("/session", HTTP_GET, handleSession);
@@ -1858,6 +2052,10 @@ void setupWebServer() {
   server.on("/images/raw", HTTP_GET, handleImagesRaw);
   server.on("/images/delete", HTTP_POST, handleImagesDelete);
   server.on("/display/show", HTTP_POST, handleDisplayShow);
+  server.on("/sd/list", HTTP_GET, handleSdList);
+  server.on("/sd/upload", HTTP_POST, handleSdUploadDone, handleSdUploadStream);
+  server.on("/sd/delete", HTTP_POST, handleSdDelete);
+  server.on("/sd/mkdir", HTTP_POST, handleSdMkdir);
   server.on("/osha/config", HTTP_POST, handleOshaConfig);
   server.on("/osha/refresh", HTTP_POST, handleOshaRefresh);
 
@@ -1916,6 +2114,7 @@ void setup() {
     Serial.println("SD card mount failed; check card and wiring");
   } else {
     Serial.println("SD card mounted successfully");
+    appendDeviceLog("Device boot: SD card mounted");
   }
   setenv("TZ", "EST5EDT", 1);
   tzset();
