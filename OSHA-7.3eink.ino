@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <vector>
+#include <memory>
 #include <algorithm>
 #include <time.h>
 
@@ -178,6 +179,8 @@ uint32_t sleepHours = 24;  // Default: wake once per day
 volatile bool displayBusy = false;
 static bool uploadInProgress = false;
 static size_t imageBytesWritten = 0;
+static bool displayUploadFailed = false;
+static String displayUploadError = "";
 
 File currentImageFile;
 
@@ -784,20 +787,15 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
   bytesReadTotalOut = 0;
   bodyBufferedCompleteOut = true;
   bodyOut = "";
+
   int expectedLength = http.getSize();
   bool hasContentLength = expectedLength >= 0;
   size_t contentLength = hasContentLength ? (size_t)expectedLength : 0;
-  if (hasContentLength && contentLength <= HTTP_BODY_MAX_BUFFER) {
-    bodyOut.reserve(contentLength + 1);
-  }
+  if (hasContentLength && contentLength <= HTTP_BODY_MAX_BUFFER) bodyOut.reserve(contentLength + 1);
 
   String transferEncoding = http.header("Transfer-Encoding");
   transferEncoding.toLowerCase();
   bool chunked = transferEncoding.indexOf("chunked") >= 0;
-  Serial.printf("OSHA: body parser framing parsed content_length=%d is_chunked=%d\n",
-                expectedLength, chunked ? 1 : 0);
-  appendDeviceLog("OSHA parser framing: content_length=%d chunked=%d",
-                  expectedLength, chunked ? 1 : 0);
 
   File out;
   if (sdMounted && sdPath && sdPath[0]) {
@@ -806,40 +804,25 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
     if (!out) return false;
   }
 
-  unsigned long lastDataAt = millis();
-  unsigned long startedAt = lastDataAt;
+  unsigned long startedAt = millis();
+  unsigned long lastDataAt = startedAt;
   uint8_t buf[1024];
   size_t contentBytesRead = 0;
-  size_t nextProgressLogAt = 8192;
   String exitReason = "connection-close";
 
-  enum ChunkState {
-    CHUNK_SIZE,
-    CHUNK_DATA,
-    CHUNK_DATA_CR,
-    CHUNK_DATA_LF,
-    CHUNK_TRAILERS
-  };
+  enum ChunkState { CHUNK_SIZE, CHUNK_DATA, CHUNK_DATA_CR, CHUNK_DATA_LF, CHUNK_TRAILERS };
   ChunkState chunkState = CHUNK_SIZE;
   size_t chunkBytesRemaining = 0;
   String chunkLine = "";
 
   auto writeDecoded = [&](uint8_t b) {
-    if (bodyBufferedCompleteOut) {
-      if (bodyOut.length() < HTTP_BODY_MAX_BUFFER) {
-        size_t prevLen = bodyOut.length();
-        bodyOut += (char)b;
-        if (bodyOut.length() != prevLen + 1) bodyBufferedCompleteOut = false;
-      } else {
-        bodyBufferedCompleteOut = false;
-      }
+    if (bodyBufferedCompleteOut && bodyOut.length() < HTTP_BODY_MAX_BUFFER) {
+      bodyOut += (char)b;
+    } else {
+      bodyBufferedCompleteOut = false;
     }
     if (out) out.write(&b, 1);
     contentBytesRead++;
-    if (contentBytesRead >= nextProgressLogAt) {
-      Serial.printf("OSHA: body parser progress bytes_read=%u\n", (unsigned int)contentBytesRead);
-      nextProgressLogAt += 8192;
-    }
   };
 
   auto parseChunkSizeLine = [&](const String &line, size_t &sizeOut) -> bool {
@@ -862,49 +845,45 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
     return true;
   };
 
-  while (http.connected() || stream->available() > 0) {
+  while (true) {
     unsigned long now = millis();
     if (hardTimeoutMs > 0 && now - startedAt > hardTimeoutMs) {
       exitReason = "hard-timeout";
-      if (out) out.close();
-      bytesReadTotalOut = contentBytesRead;
-      appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-      return false;
+      break;
     }
 
     int avail = stream->available();
     if (avail <= 0) {
+      if (!http.connected()) {
+        exitReason = "connection-close";
+        break;
+      }
       if (idleTimeoutMs > 0 && now - lastDataAt > idleTimeoutMs) {
         exitReason = "idle-timeout";
-        if (out) out.close();
-        bytesReadTotalOut = contentBytesRead;
-        appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-        return false;
+        break;
       }
       delay(2);
       continue;
     }
 
     int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
-    if (n <= 0) continue;
-
+    if (n <= 0) {
+      delay(1);
+      continue;
+    }
     lastDataAt = millis();
+
     if (!chunked) {
       int bytesToConsume = n;
       if (hasContentLength) {
-        size_t remaining = (contentBytesRead < contentLength) ? (contentLength - contentBytesRead) : 0;
-        bytesToConsume = min((size_t)n, remaining);
+        size_t remaining = contentBytesRead < contentLength ? (contentLength - contentBytesRead) : 0;
+        bytesToConsume = (int)min((size_t)n, remaining);
       }
       for (int i = 0; i < bytesToConsume; i++) writeDecoded(buf[i]);
       if (hasContentLength && contentBytesRead >= contentLength) {
         completeOut = (contentBytesRead == contentLength);
-        bytesReadTotalOut = contentBytesRead;
         exitReason = completeOut ? "content-length-satisfied" : "content-length-overread";
-        if (out) out.close();
-        Serial.printf("OSHA: body parser exit reason=%s bytes_read=%u\n",
-                      exitReason.c_str(), (unsigned int)contentBytesRead);
-        appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-        return completeOut;
+        break;
       }
       continue;
     }
@@ -916,14 +895,11 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
           size_t parsed = 0;
           if (!parseChunkSizeLine(chunkLine, parsed)) {
             exitReason = "chunk-size-parse-failed";
-            if (out) out.close();
-            bytesReadTotalOut = contentBytesRead;
-            appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-            return false;
+            goto body_parser_done;
           }
           chunkLine = "";
           chunkBytesRemaining = parsed;
-          chunkState = (chunkBytesRemaining == 0) ? CHUNK_TRAILERS : CHUNK_DATA;
+          chunkState = chunkBytesRemaining == 0 ? CHUNK_TRAILERS : CHUNK_DATA;
         } else if (c != '\r') {
           chunkLine += c;
         }
@@ -933,19 +909,13 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
       } else if (chunkState == CHUNK_DATA_CR) {
         if (c != '\r') {
           exitReason = "chunk-data-missing-cr";
-          if (out) out.close();
-          bytesReadTotalOut = contentBytesRead;
-          appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-          return false;
+          goto body_parser_done;
         }
         chunkState = CHUNK_DATA_LF;
       } else if (chunkState == CHUNK_DATA_LF) {
         if (c != '\n') {
           exitReason = "chunk-data-missing-lf";
-          if (out) out.close();
-          bytesReadTotalOut = contentBytesRead;
-          appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-          return false;
+          goto body_parser_done;
         }
         chunkState = CHUNK_SIZE;
       } else if (chunkState == CHUNK_TRAILERS) {
@@ -953,12 +923,7 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
           if (chunkLine.length() == 0) {
             completeOut = true;
             exitReason = "final-chunk";
-            if (out) out.close();
-            bytesReadTotalOut = contentBytesRead;
-            Serial.printf("OSHA: body parser exit reason=%s bytes_read=%u\n",
-                          exitReason.c_str(), (unsigned int)contentBytesRead);
-            appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-            return true;
+            goto body_parser_done;
           }
           chunkLine = "";
         } else if (c != '\r') {
@@ -968,31 +933,32 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
     }
   }
 
-  if (chunked) {
+body_parser_done:
+  if (!chunked) {
+    if (!completeOut) {
+      completeOut = hasContentLength ? (contentBytesRead == contentLength) : (exitReason == "connection-close");
+      if (exitReason == "connection-close" && hasContentLength && contentBytesRead != contentLength) {
+        exitReason = "content-length-mismatch";
+      }
+    }
+  } else if (!completeOut && exitReason == "connection-close") {
     completeOut = (chunkState == CHUNK_TRAILERS && chunkLine.length() == 0);
-    exitReason = completeOut ? "final-chunk" : "chunked-stream-ended-early";
-  } else {
-    completeOut = hasContentLength ? (contentBytesRead == contentLength) : true;
-    exitReason = hasContentLength
-      ? (completeOut ? "content-length-satisfied" : "content-length-mismatch")
-      : "connection-close";
+    if (!completeOut) exitReason = "chunked-stream-ended-early";
   }
 
-  if (hasContentLength && contentBytesRead != contentLength) {
-    if (out) out.close();
-    bytesReadTotalOut = contentBytesRead;
-    appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
-    return false;
+  if (out) {
+    out.flush();
+    out.close();
   }
-
-  if (out) out.close();
   bytesReadTotalOut = contentBytesRead;
-  Serial.printf("OSHA: body parser exit reason=%s bytes_read=%u\n",
-                exitReason.c_str(), (unsigned int)contentBytesRead);
-  appendDeviceLog("OSHA parser exit: reason=%s bytes=%u", exitReason.c_str(), (unsigned int)contentBytesRead);
+  appendDeviceLog("OSHA parser exit: reason=%s bytes=%u complete=%d", exitReason.c_str(), (unsigned int)contentBytesRead, completeOut ? 1 : 0);
+
+  if (exitReason == "hard-timeout" || exitReason == "idle-timeout") return false;
+  if (hasContentLength && contentBytesRead != contentLength) return false;
   if (chunked && !completeOut) return false;
-  return true;
+  return completeOut;
 }
+
 
 bool decodeChunkedBodyForTest(const String &encoded, String &decodedOut) {
   decodedOut = "";
@@ -1636,10 +1602,16 @@ void handleUploadStream() {
 
   if (up.status == UPLOAD_FILE_START) {
     logWebRequest("handleUploadStream:UPLOAD_FILE_START");
-    if (displayBusy) return;
+    if (displayBusy || uploadInProgress) {
+      displayUploadFailed = true;
+      displayUploadError = "display busy";
+      return;
+    }
 
     displayBusy = true;
     uploadInProgress = true;
+    displayUploadFailed = false;
+    displayUploadError = "";
     imageBytesWritten = 0;
 
     maybeOpenSDForSave();
@@ -1654,7 +1626,6 @@ void handleUploadStream() {
 
     for (size_t i = 0; i < n && imageBytesWritten < EPD_BUFFER_SIZE; i++) {
       uint8_t byteIn = buf[i];
-
       int byteIndex = (int)imageBytesWritten;
       int y = byteIndex / BYTES_PER_ROW;
       int xb = byteIndex % BYTES_PER_ROW;
@@ -1663,27 +1634,36 @@ void handleUploadStream() {
 
       uint8_t hi = (byteIn >> 4) & 0x0F;
       uint8_t lo = (byteIn >> 0) & 0x0F;
-
       hi = applyLowBatteryOverlayNibble(x1, y, hi);
       lo = applyLowBatteryOverlayNibble(x2, y, lo);
 
       uint8_t byteOut = (hi << 4) | lo;
-
       Epaper_Write_Data(byteOut);
       if (currentImageFile) currentImageFile.write(byteOut);
-
       imageBytesWritten++;
     }
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Serial.println("WEB: display upload aborted");
+    appendDeviceLog("Display upload aborted");
+    displayUploadFailed = true;
+    displayUploadError = "upload aborted";
     uploadInProgress = false;
     displayBusy = false;
     if (currentImageFile) currentImageFile.close();
   }
 }
 
+
 void handleUploadDone() {
   logWebRequest("handleUploadDone");
+  if (displayUploadFailed) {
+    if (currentImageFile) { currentImageFile.flush(); currentImageFile.close(); }
+    uploadInProgress = false;
+    displayBusy = false;
+    String json = String("{\"error\":\"") + displayUploadError + "\"}";
+    server.send(409, "application/json", json);
+    return;
+  }
   if (!uploadInProgress) { server.send(500, "application/json", "{\"error\":\"no upload\"}"); return; }
 
   while (imageBytesWritten < EPD_BUFFER_SIZE) {
@@ -1692,7 +1672,10 @@ void handleUploadDone() {
     imageBytesWritten++;
   }
 
-  if (currentImageFile) currentImageFile.close();
+  if (currentImageFile) {
+    currentImageFile.flush();
+    currentImageFile.close();
+  }
 
   setOshaModeEnabled(false);
   appendDeviceLog("Manual override image uploaded and displayed");
@@ -1703,7 +1686,9 @@ void handleUploadDone() {
   server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Upload complete, refreshing\"}");
 }
 
+
 void writeDisplayRefreshSequence() {
+  displayBusy = true;
   Epaper_Write_Command(DRF);
   Epaper_Write_Data(0x00);
   Epaper_READBUSY();
@@ -1713,6 +1698,12 @@ void writeDisplayRefreshSequence() {
 
 void processPendingDisplayRefresh() {
   if (!pendingDisplayRefresh) return;
+  if (displayBusy || uploadInProgress) return;
+  if (!sdMounted) {
+    appendDeviceLog("Display refresh skipped: SD unavailable");
+    pendingDisplayRefresh = false;
+    return;
+  }
   pendingDisplayRefresh = false;
   writeDisplayRefreshSequence();
 }
@@ -1850,6 +1841,7 @@ bool loadOshaStateFromSd(OshaState &state) {
 
 bool saveOshaStateToSd(const OshaState &state) {
   if (!sdMounted) return false;
+  if (SD.exists("/osha/state.json")) SD.remove("/osha/state.json");
   File f = SD.open("/osha/state.json", FILE_WRITE);
   if (!f) return false;
   DynamicJsonDocument d(512);
@@ -1872,24 +1864,22 @@ bool saveIncidentDebugFile(const String &name, const String &content) {
 }
 
 bool fetchOshaState(OshaState &stateOut) {
-  if (!oshaEnabled) {
-    Serial.println("OSHA: fetch skipped; OSHA mode disabled");
-    appendDeviceLog("OSHA poll skipped: mode disabled");
-    return false;
-  }
-  if (oshaToken.length() == 0) {
-    Serial.println("OSHA: fetch skipped; missing token");
-    appendDeviceLog("OSHA poll skipped: token missing");
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("OSHA: fetch skipped; WiFi not connected");
-    appendDeviceLog("OSHA poll skipped: WiFi disconnected");
-    return false;
-  }
-  std::vector<std::pair<time_t, String>> offenses;
-  String cursor = "";
+  if (!oshaEnabled || oshaToken.length() == 0 || WiFi.status() != WL_CONNECTED) return false;
 
+  std::vector<std::pair<time_t, String>> offenses;
+  std::vector<String> allowedValues;
+  int csvStart = 0;
+  while (csvStart <= (int)oshaSelfInflictedOneOf.length()) {
+    int comma = oshaSelfInflictedOneOf.indexOf(',', csvStart);
+    String token = (comma >= 0) ? oshaSelfInflictedOneOf.substring(csvStart, comma)
+                                : oshaSelfInflictedOneOf.substring(csvStart);
+    token.trim();
+    if (token.length() > 0) allowedValues.push_back(token);
+    if (comma < 0) break;
+    csvStart = comma + 1;
+  }
+
+  String cursor = "";
   while (true) {
     String url = oshaBaseUrl;
     String queryPrefix = url.indexOf('?') >= 0 ? "&" : "?";
@@ -1897,229 +1887,168 @@ bool fetchOshaState(OshaState &stateOut) {
     url += queryPrefix + urlEncodeComponent(fieldFilterKey) + "=" + urlEncodeComponent(oshaSelfInflictedOneOf);
     if (url.indexOf("page_size=") < 0) url += "&page_size=25";
     if (cursor.length() > 0) url += "&cursor=" + urlEncodeComponent(cursor);
-    int32_t freeHeapBefore = ESP.getFreeHeap();
-    long rssi = WiFi.RSSI();
-    Serial.printf("OSHA: request context heap_before=%ld rssi=%ld url=%s\n", (long)freeHeapBefore, rssi, url.c_str());
 
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    const bool tlsInsecure = true;
-
+    std::unique_ptr<WiFiClientSecure> secureClient(new WiFiClientSecure());
+    secureClient->setInsecure();
     HTTPClient http;
     http.useHTTP10(false);
     http.setConnectTimeout(15000);
     http.setTimeout(30000);
-    Serial.printf("OSHA: fetching incidents from %s\n", url.c_str());
-    if (!http.begin(secureClient, url)) {
-      Serial.println("OSHA: failed to start HTTPS client");
+    if (!http.begin(*secureClient, url)) {
       appendDeviceLog("OSHA poll failed: HTTPS begin failed");
       return false;
     }
+
     http.addHeader("Authorization", "Bearer " + oshaToken);
     http.addHeader("Accept", "application/json");
+    http.addHeader("Content-Type", "application/json");
     http.addHeader("Accept-Encoding", "identity");
-    http.addHeader("Connection", "close");
     const char *trackedHeaders[] = {"Content-Type", "Content-Length", "Transfer-Encoding", "Content-Encoding"};
     http.collectHeaders(trackedHeaders, 4);
-    Serial.printf("OSHA: request headers Authorization=Bearer <redacted> Accept=application/json Accept-Encoding=identity\n");
-    unsigned long requestStartedAt = millis();
+
     int code = http.GET();
-    unsigned long firstByteAt = millis();
-    String readMode = "stream";
-    logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
     if (code != HTTP_CODE_OK) {
-      String err = http.errorToString(code);
       String body = http.getString();
-      readMode = "getString";
-      logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
-      String bodyPreview = body;
-      if (bodyPreview.length() > 300) bodyPreview = bodyPreview.substring(0, 300) + "...";
-      Serial.printf("OSHA: API GET failed with code %d (%s)\n", code, err.c_str());
-      appendDeviceLog("OSHA poll failed: HTTP %d (%s)", code, err.c_str());
-      if (body.length() > 0) {
-        Serial.printf("OSHA: API error body: %s\n", bodyPreview.c_str());
-        saveIncidentDebugFile("incident-last-error.txt", body);
-      }
+      if (body.length() > 0) saveIncidentDebugFile("incident-last-error.txt", body);
+      appendDeviceLog("OSHA poll failed: HTTP %d", code);
       http.end();
       return false;
     }
 
-    String contentType = http.header("Content-Type");
-    String lowerCt = contentType;
-    lowerCt.toLowerCase();
-
-    if (sdMounted) ensureDirectory("/cache");
     String payload;
     bool bodyComplete = false;
     size_t bytesReadTotal = 0;
     bool bodyBufferedComplete = false;
-    String transferEncoding = http.header("Transfer-Encoding");
-    transferEncoding.toLowerCase();
-    bool responseChunked = transferEncoding.indexOf("chunked") >= 0;
+    if (sdMounted) ensureDirectory("/cache");
     if (!readHttpBodyWithTimeout(http, payload, "/cache/incidents.json", 20000, 90000,
-                                 bodyComplete, bytesReadTotal, bodyBufferedComplete)) {
-      Serial.printf("OSHA: API body read failed or timed out (bytes=%u complete=%d)\n",
-                    (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
-      appendDeviceLog("OSHA poll failed: body read timeout/truncated bytes=%u complete=%d",
-                      (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
+                                 bodyComplete, bytesReadTotal, bodyBufferedComplete) || !bodyComplete) {
+      persistParseFailureArtifacts(payload, "http-body-incomplete");
       http.end();
       return false;
     }
-    Serial.printf("OSHA: API body read complete bytes=%u complete=%d\n",
-                  (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
-    appendDeviceLog("OSHA poll body read bytes=%u complete=%d",
-                    (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
-    logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
-    Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
-    if (!bodyBufferedComplete) {
-      Serial.printf("OSHA: payload buffer truncated (buffered=%u, streamed=%u); parsing from SD cache\n",
-                    (unsigned int)payload.length(), (unsigned int)bytesReadTotal);
-      appendDeviceLog("OSHA poll body buffered=%u streamed=%u truncated=1",
-                      (unsigned int)payload.length(), (unsigned int)bytesReadTotal);
-    }
-    saveIncidentDebugFile("incident-last.json", payload);
-    Serial.printf("OSHA: body[0:256]=%s\n", escapedPreview(payload, 256).c_str());
+
     if (payload.length() == 0) {
-      Serial.println("OSHA: API returned empty payload");
       persistParseFailureArtifacts(payload, "empty-payload");
       http.end();
       return false;
     }
 
-    if (!lowerCt.startsWith("application/json")) {
-      Serial.printf("OSHA: unexpected Content-Type for incidents payload: %s\n", contentType.c_str());
-      appendDeviceLog("OSHA poll failed: unexpected content-type %s", contentType.c_str());
-      persistParseFailureArtifacts(payload, "unexpected-content-type");
-      http.end();
-      return false;
-    }
-
-    String contentEncoding = http.header("Content-Encoding");
-    String lowerEncoding = contentEncoding;
-    lowerEncoding.toLowerCase();
-    if (lowerEncoding.indexOf("gzip") >= 0) {
-      Serial.printf("OSHA: gzip-encoded response not supported for JSON parse: %s\n", contentEncoding.c_str());
-      appendDeviceLog("OSHA poll failed: gzip content-encoding unsupported (%s)", contentEncoding.c_str());
-      persistParseFailureArtifacts(payload, "gzip-content-encoding");
-      http.end();
-      return false;
-    }
-
-    DynamicJsonDocument filter(1024);
+    DynamicJsonDocument filter(2048);
     filter["incidents"][0]["id"] = true;
     filter["incidents"][0]["incident_date"] = true;
+    filter["incidents"][0]["created_at"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["custom_field"]["id"] = true;
     filter["incidents"][0]["custom_field_entries"][0]["custom_field"]["name"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["value_catalog_entry"]["id"] = true;
     filter["incidents"][0]["custom_field_entries"][0]["value_catalog_entry"]["label"] = true;
+    filter["incidents"][0]["custom_field_entries"][0]["value"]["id"] = true;
     filter["incidents"][0]["custom_field_entries"][0]["value"]["label"] = true;
     filter["incidents"][0]["custom_field_entries"][0]["value"] = true;
     filter["pagination"]["next_cursor"] = true;
     filter["next_cursor"] = true;
 
-    File cachedPayload;
-    bool parseFromCacheFile = sdMounted && SD.exists("/cache/incidents.json") &&
-                              (responseChunked || !bodyBufferedComplete || bytesReadTotal != payload.length());
-    if (parseFromCacheFile) {
-      cachedPayload = SD.open("/cache/incidents.json", FILE_READ);
-      if (!cachedPayload) {
-        parseFromCacheFile = false;
-        appendDeviceLog("OSHA poll warning: failed to open /cache/incidents.json for parse fallback");
-      }
+    size_t parseBytes = bytesReadTotal > 0 ? bytesReadTotal : payload.length();
+    DynamicJsonDocument d(max((size_t)4096, parseBytes / 2 + 4096));
+    DeserializationError err;
+    if (sdMounted && SD.exists("/cache/incidents.json") && !bodyBufferedComplete) {
+      File cache = SD.open("/cache/incidents.json", FILE_READ);
+      err = cache ? deserializeJson(d, cache, DeserializationOption::Filter(filter)) : DeserializationError::EmptyInput;
+      if (cache) cache.close();
+    } else {
+      err = deserializeJson(d, payload, DeserializationOption::Filter(filter));
     }
-
-    size_t parseSourceBytes = parseFromCacheFile ? (size_t)bytesReadTotal : payload.length();
-    size_t docCapacity = max((size_t)4096, parseSourceBytes / 2 + 4096);
-    DynamicJsonDocument d(docCapacity);
-    DeserializationError err = parseFromCacheFile
-      ? deserializeJson(d, cachedPayload, DeserializationOption::Filter(filter))
-      : deserializeJson(d, payload, DeserializationOption::Filter(filter));
-    if (cachedPayload) cachedPayload.close();
     http.end();
     if (err) {
-      const char *parseMode = parseFromCacheFile ? "File" : "String";
-      Serial.printf("OSHA: JSON parse failed: %s (%d), parse_mode=%s, doc_capacity=%u\n",
-                    err.c_str(), (int)err.code(), parseMode, (unsigned int)docCapacity);
-      appendDeviceLog("OSHA poll failed: JSON parse error %s (%d) cap=%u mode=%s",
-                      err.c_str(), (int)err.code(), (unsigned int)docCapacity, parseMode);
       persistParseFailureArtifacts(payload, "json-deserialize-failed");
+      appendDeviceLog("OSHA poll failed: JSON parse error %s", err.c_str());
       return false;
     }
 
     JsonArray incidents = d["incidents"].as<JsonArray>();
     for (JsonVariant iv : incidents) {
       String classification = "";
+      bool selfInflictedMatch = false;
       JsonArray entries = iv["custom_field_entries"].as<JsonArray>();
       for (JsonVariant ev : entries) {
         String fieldName = String((const char*)(ev["custom_field"]["name"] | ""));
+        String fieldId = String((const char*)(ev["custom_field"]["id"] | ""));
         String lower = fieldName; lower.toLowerCase();
         if (lower == "rca classification") {
           classification = String((const char*)(ev["value_catalog_entry"]["label"] | ev["value"]["label"] | ev["value"] | ""));
-          break;
+        }
+        if (fieldId == oshaSelfInflictedFieldId) {
+          String valueId = String((const char*)(ev["value_catalog_entry"]["id"] | ev["value"]["id"] | ev["value"] | ""));
+          for (const String &allowed : allowedValues) {
+            if (valueId == allowed) {
+              selfInflictedMatch = true;
+              break;
+            }
+          }
         }
       }
+      if (!selfInflictedMatch) continue;
       String cat = normalizeOshaCategory(classification);
       String cl = classification; cl.toLowerCase();
       if (cl == "non-procedural incident" || cl == "not classified" || cat.length() == 0) continue;
 
-      String dateIso = String((const char*)(iv["incident_date"] | ""));
       time_t ep = 0;
+      String dateIso = String((const char*)(iv["incident_date"] | iv["created_at"] | ""));
       if (!parseIsoToEpoch(dateIso, ep)) continue;
       offenses.push_back({ep, cat + "|" + String((const char*)(iv["id"] | ""))});
     }
 
     String nextCursor = String((const char*)(d["pagination"]["next_cursor"] | d["next_cursor"] | ""));
-    int32_t freeHeapAfter = ESP.getFreeHeap();
-    Serial.printf("OSHA: request context heap_after=%ld rssi=%ld next_cursor_len=%u\n",
-                  (long)freeHeapAfter, rssi, (unsigned int)nextCursor.length());
     if (nextCursor.length() == 0) break;
     cursor = nextCursor;
   }
 
   if (offenses.empty()) {
-    Serial.println("OSHA: no qualifying offenses found");
-    appendDeviceLog("OSHA poll success: no qualifying offenses");
     stateOut = {0,0,"","",""};
-    return true;
-  }
+  } else {
+    std::sort(offenses.begin(), offenses.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+    std::vector<String> uniqueDates;
+    time_t latestEp = offenses[0].first;
+    String latestCat = "";
+    String latestId = "";
 
-  std::sort(offenses.begin(), offenses.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
-
-  std::vector<String> uniqueDates;
-  time_t latestEp = 0;
-  String latestCat = "";
-  String latestId = "";
-
-  for (auto &off : offenses) {
-    String nyDate = epochToNyDate(off.first);
-    bool seen = false;
-    for (auto &d : uniqueDates) if (d == nyDate) { seen = true; break; }
-    if (seen) continue;
-    uniqueDates.push_back(nyDate);
-    int sep = off.second.indexOf('|');
-    String cat = off.second.substring(0, sep);
-    String iid = off.second.substring(sep + 1);
-    if (uniqueDates.size() == 1) {
-      latestEp = off.first;
-      latestCat = cat;
-      latestId = iid;
+    for (auto &off : offenses) {
+      String nyDate = epochToNyDate(off.first);
+      bool seen = false;
+      for (auto &d : uniqueDates) if (d == nyDate) { seen = true; break; }
+      if (seen) continue;
+      uniqueDates.push_back(nyDate);
+      int sep = off.second.indexOf('|');
+      String cat = off.second.substring(0, sep);
+      String iid = off.second.substring(sep + 1);
+      if (uniqueDates.size() == 1) {
+        latestEp = off.first;
+        latestCat = cat;
+        latestId = iid;
+      }
     }
+
+    String latestDate = epochToNyDate(latestEp);
+    String todayDate = nyTodayDate();
+    String digits = "";
+    for (size_t i = 0; i < latestId.length(); i++) if (isdigit(latestId[i])) digits += latestId[i];
+
+    stateOut.days = daysBetweenDates(latestDate, todayDate);
+    stateOut.prior = max(0, (int)uniqueDates.size() - 1);
+    stateOut.incident = digits;
+    stateOut.date = latestDate;
+    stateOut.reason = latestCat;
   }
 
-  String latestDate = epochToNyDate(latestEp);
-  String todayDate = nyTodayDate();
-
-  String digits = "";
-  for (size_t i = 0; i < latestId.length(); i++) if (isdigit(latestId[i])) digits += latestId[i];
-
-  stateOut.days = daysBetweenDates(latestDate, todayDate);
-  stateOut.prior = (int)uniqueDates.size() - 1;
-  stateOut.incident = digits;
-  stateOut.date = latestDate;
-  stateOut.reason = latestCat;
-  Serial.printf("OSHA: computed state days=%d prior=%d incident=%s date=%s reason=%s\n",
-                stateOut.days, stateOut.prior, stateOut.incident.c_str(),
-                stateOut.date.c_str(), stateOut.reason.c_str());
+  currentOshaState = stateOut;
+  oshaDays = stateOut.days;
+  oshaPrior = stateOut.prior;
+  oshaIncident = stateOut.incident;
+  oshaDate = stateOut.date;
+  oshaReason = stateOut.reason;
+  if (!saveOshaStateToSd(stateOut)) appendDeviceLog("OSHA warning: unable to persist /osha/state.json");
   return true;
 }
+
 
 bool renderOshaDisplay(const OshaState &state) {
   if (!sdMounted) return false;
@@ -2301,15 +2230,15 @@ void handleImagesUploadStream() {
     galleryBytesWritten = 0;
     galleryFileName = sanitizeGalleryFileName(server.hasArg("name") ? server.arg("name") : "");
     if (galleryFile) galleryFile.close();
-    galleryFile = SD.open(("/gallery/" + galleryFileName).c_str(), FILE_WRITE);
+    String fullPath = "/gallery/" + galleryFileName;
+    if (SD.exists(fullPath.c_str())) SD.remove(fullPath.c_str());
+    galleryFile = SD.open(fullPath.c_str(), FILE_WRITE);
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (!galleryFile) return;
-    for (size_t i = 0; i < up.currentSize && galleryBytesWritten < EPD_BUFFER_SIZE; i++) {
-      galleryFile.write(up.buf[i]);
-      galleryBytesWritten++;
-    }
+    size_t wrote = galleryFile.write(up.buf, up.currentSize);
+    galleryBytesWritten += wrote;
   } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
-    if (galleryFile) galleryFile.close();
+    if (galleryFile) { galleryFile.flush(); galleryFile.close(); }
   }
 }
 
