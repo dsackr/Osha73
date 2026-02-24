@@ -220,7 +220,8 @@ bool saveIncidentDebugFile(const String &name, const String &content);
 bool refreshDefaultUiFromGithub(String &errorOut);
 bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPath,
                              unsigned long idleTimeoutMs, unsigned long hardTimeoutMs,
-                             bool &completeOut, size_t &bytesReadTotalOut);
+                             bool &completeOut, size_t &bytesReadTotalOut,
+                             bool &bodyBufferedCompleteOut);
 String escapedPreview(const String &input, size_t maxLen);
 void logHttpResponseMeta(const String &url, HTTPClient &http, int code, const String &readMode,
                          unsigned long startedAt, unsigned long firstByteAt, bool tlsInsecure);
@@ -771,12 +772,14 @@ bool refreshDefaultUiFromGithub(String &errorOut) {
 
 bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPath,
                              unsigned long idleTimeoutMs, unsigned long hardTimeoutMs,
-                             bool &completeOut, size_t &bytesReadTotalOut) {
+                             bool &completeOut, size_t &bytesReadTotalOut,
+                             bool &bodyBufferedCompleteOut) {
   WiFiClient *stream = http.getStreamPtr();
   if (!stream) return false;
 
   completeOut = false;
   bytesReadTotalOut = 0;
+  bodyBufferedCompleteOut = true;
   bodyOut = "";
   int expectedLength = http.getSize();
   if (expectedLength > 0) bodyOut.reserve((size_t)expectedLength + 1);
@@ -809,7 +812,9 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPa
   String chunkLine = "";
 
   auto writeDecoded = [&](uint8_t b) {
+    size_t prevLen = bodyOut.length();
     bodyOut += (char)b;
+    if (bodyOut.length() != prevLen + 1) bodyBufferedCompleteOut = false;
     if (out) out.write(&b, 1);
     contentBytesRead++;
   };
@@ -1855,7 +1860,9 @@ bool fetchOshaState(OshaState &stateOut) {
     String payload;
     bool bodyComplete = false;
     size_t bytesReadTotal = 0;
-    if (!readHttpBodyWithTimeout(http, payload, "/cache/incidents.json", 20000, 90000, bodyComplete, bytesReadTotal)) {
+    bool bodyBufferedComplete = false;
+    if (!readHttpBodyWithTimeout(http, payload, "/cache/incidents.json", 20000, 90000,
+                                 bodyComplete, bytesReadTotal, bodyBufferedComplete)) {
       Serial.printf("OSHA: API body read failed or timed out (bytes=%u complete=%d)\n",
                     (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
       appendDeviceLog("OSHA poll failed: body read timeout/truncated bytes=%u complete=%d",
@@ -1869,6 +1876,12 @@ bool fetchOshaState(OshaState &stateOut) {
                     (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
     logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
     Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
+    if (!bodyBufferedComplete) {
+      Serial.printf("OSHA: payload buffer truncated (buffered=%u, streamed=%u); parsing from SD cache\n",
+                    (unsigned int)payload.length(), (unsigned int)bytesReadTotal);
+      appendDeviceLog("OSHA poll body buffered=%u streamed=%u truncated=1",
+                      (unsigned int)payload.length(), (unsigned int)bytesReadTotal);
+    }
     saveIncidentDebugFile("incident-last.json", payload);
     Serial.printf("OSHA: body[0:256]=%s\n", escapedPreview(payload, 256).c_str());
     if (payload.length() == 0) {
@@ -1907,15 +1920,30 @@ bool fetchOshaState(OshaState &stateOut) {
     filter["pagination"]["next_cursor"] = true;
     filter["next_cursor"] = true;
 
-    size_t docCapacity = max((size_t)4096, payload.length() / 2 + 4096);
+    File cachedPayload;
+    bool parseFromCacheFile = !bodyBufferedComplete && sdMounted && SD.exists("/cache/incidents.json");
+    if (parseFromCacheFile) {
+      cachedPayload = SD.open("/cache/incidents.json", FILE_READ);
+      if (!cachedPayload) {
+        parseFromCacheFile = false;
+        appendDeviceLog("OSHA poll warning: failed to open /cache/incidents.json for parse fallback");
+      }
+    }
+
+    size_t parseSourceBytes = parseFromCacheFile ? (size_t)bytesReadTotal : payload.length();
+    size_t docCapacity = max((size_t)4096, parseSourceBytes / 2 + 4096);
     DynamicJsonDocument d(docCapacity);
-    auto err = deserializeJson(d, payload, DeserializationOption::Filter(filter));
+    DeserializationError err = parseFromCacheFile
+      ? deserializeJson(d, cachedPayload, DeserializationOption::Filter(filter))
+      : deserializeJson(d, payload, DeserializationOption::Filter(filter));
+    if (cachedPayload) cachedPayload.close();
     http.end();
     if (err) {
-      Serial.printf("OSHA: JSON parse failed: %s (%d), parse_mode=String, doc_capacity=%u\n",
-                    err.c_str(), (int)err.code(), (unsigned int)docCapacity);
-      appendDeviceLog("OSHA poll failed: JSON parse error %s (%d) cap=%u mode=String",
-                      err.c_str(), (int)err.code(), (unsigned int)docCapacity);
+      const char *parseMode = parseFromCacheFile ? "File" : "String";
+      Serial.printf("OSHA: JSON parse failed: %s (%d), parse_mode=%s, doc_capacity=%u\n",
+                    err.c_str(), (int)err.code(), parseMode, (unsigned int)docCapacity);
+      appendDeviceLog("OSHA poll failed: JSON parse error %s (%d) cap=%u mode=%s",
+                      err.c_str(), (int)err.code(), (unsigned int)docCapacity, parseMode);
       persistParseFailureArtifacts(payload, "json-deserialize-failed");
       return false;
     }
