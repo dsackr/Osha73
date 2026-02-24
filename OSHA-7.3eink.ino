@@ -126,6 +126,8 @@ size_t galleryBytesWritten = 0;
 bool oshaEnabled = false;
 String oshaToken = "";
 String oshaBaseUrl = "https://api.incident.io/v2/incidents";
+String oshaSelfInflictedFieldId = "01JZ0PNKHCB3M6NX0AHPABS59D";
+String oshaSelfInflictedOneOf = "01JZ0PNKHC4Y48M2RS8BADQYR2,01JZ0PNKHC55GCAZH5RJDDK54K,01K239XGE8XWCS50513AGVFVCA";
 
 int oshaDays = 0;
 int oshaPrior = 0;
@@ -244,6 +246,7 @@ bool shouldOverwriteLowBattery();
 uint8_t applyLowBatteryOverlayNibble(int x, int y, uint8_t nibble);
 
 String sanitizeFileName(const String &name);
+String urlEncodeComponent(const String &value);
 void maybeOpenSDForSave();
 bool fetchAndDisplayOneShot();
 void shutdownForever();
@@ -583,6 +586,23 @@ String sanitizeGalleryFileName(const String &name) {
   String clean = sanitizeFileName(name);
   if (clean.length() == 0) clean = "image" + String(millis()) + ".bin";
   return clean;
+}
+
+String urlEncodeComponent(const String &value) {
+  String encoded = "";
+  const char hex[] = "0123456789ABCDEF";
+  for (size_t i = 0; i < value.length(); i++) {
+    uint8_t c = (uint8_t)value.charAt(i);
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
 }
 
 void ensureGalleryDir() {
@@ -1777,7 +1797,10 @@ bool fetchOshaState(OshaState &stateOut) {
 
   while (true) {
     String url = oshaBaseUrl;
-    if (cursor.length() > 0) url += "?cursor=" + cursor;
+    String queryPrefix = url.indexOf('?') >= 0 ? "&" : "?";
+    String fieldFilterKey = "custom_field[" + oshaSelfInflictedFieldId + "][one_of]";
+    url += queryPrefix + urlEncodeComponent(fieldFilterKey) + "=" + urlEncodeComponent(oshaSelfInflictedOneOf);
+    if (cursor.length() > 0) url += "&cursor=" + urlEncodeComponent(cursor);
     int32_t freeHeapBefore = ESP.getFreeHeap();
     long rssi = WiFi.RSSI();
     Serial.printf("OSHA: request context heap_before=%ld rssi=%ld url=%s\n", (long)freeHeapBefore, rssi, url.c_str());
