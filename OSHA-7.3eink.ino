@@ -216,7 +216,9 @@ bool sanitizeSdPath(const String &input, String &outPath);
 bool removeSdPathRecursive(const String &path);
 bool saveIncidentDebugFile(const String &name, const String &content);
 bool refreshDefaultUiFromGithub(String &errorOut);
-bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long stallTimeoutMs);
+bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPath,
+                             unsigned long idleTimeoutMs, unsigned long hardTimeoutMs,
+                             bool &completeOut, size_t &bytesReadTotalOut);
 String escapedPreview(const String &input, size_t maxLen);
 void logHttpResponseMeta(const String &url, HTTPClient &http, int code, const String &readMode,
                          unsigned long startedAt, unsigned long firstByteAt, bool tlsInsecure);
@@ -747,21 +749,84 @@ bool refreshDefaultUiFromGithub(String &errorOut) {
   return true;
 }
 
-bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long stallTimeoutMs) {
+bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, const char *sdPath,
+                             unsigned long idleTimeoutMs, unsigned long hardTimeoutMs,
+                             bool &completeOut, size_t &bytesReadTotalOut) {
   WiFiClient *stream = http.getStreamPtr();
   if (!stream) return false;
 
+  completeOut = false;
+  bytesReadTotalOut = 0;
   bodyOut = "";
   int expectedLength = http.getSize();
   if (expectedLength > 0) bodyOut.reserve((size_t)expectedLength + 1);
 
+  String transferEncoding = http.header("Transfer-Encoding");
+  transferEncoding.toLowerCase();
+  bool chunked = transferEncoding.indexOf("chunked") >= 0;
+
+  File out;
+  if (sdMounted && sdPath && sdPath[0]) {
+    if (SD.exists(sdPath)) SD.remove(sdPath);
+    out = SD.open(sdPath, FILE_WRITE);
+    if (!out) return false;
+  }
+
   unsigned long lastDataAt = millis();
+  unsigned long startedAt = lastDataAt;
   uint8_t buf[1024];
+  size_t contentBytesRead = 0;
+
+  enum ChunkState {
+    CHUNK_SIZE,
+    CHUNK_DATA,
+    CHUNK_DATA_CR,
+    CHUNK_DATA_LF,
+    CHUNK_TRAILERS
+  };
+  ChunkState chunkState = CHUNK_SIZE;
+  size_t chunkBytesRemaining = 0;
+  String chunkLine = "";
+
+  auto writeDecoded = [&](uint8_t b) {
+    bodyOut += (char)b;
+    if (out) out.write(&b, 1);
+    contentBytesRead++;
+  };
+
+  auto parseChunkSizeLine = [&](const String &line, size_t &sizeOut) -> bool {
+    String s = line;
+    s.trim();
+    int semi = s.indexOf(';');
+    if (semi >= 0) s = s.substring(0, semi);
+    s.trim();
+    if (s.length() == 0) return false;
+    sizeOut = 0;
+    for (size_t i = 0; i < s.length(); i++) {
+      char c = s[i];
+      int v = -1;
+      if (c >= '0' && c <= '9') v = c - '0';
+      else if (c >= 'a' && c <= 'f') v = 10 + (c - 'a');
+      else if (c >= 'A' && c <= 'F') v = 10 + (c - 'A');
+      else return false;
+      sizeOut = (sizeOut << 4) | (size_t)v;
+    }
+    return true;
+  };
 
   while (http.connected() || stream->available() > 0) {
+    unsigned long now = millis();
+    if (hardTimeoutMs > 0 && now - startedAt > hardTimeoutMs) {
+      if (out) out.close();
+      bytesReadTotalOut = contentBytesRead;
+      return false;
+    }
+
     int avail = stream->available();
     if (avail <= 0) {
-      if (millis() - lastDataAt > stallTimeoutMs) {
+      if (idleTimeoutMs > 0 && now - lastDataAt > idleTimeoutMs) {
+        if (out) out.close();
+        bytesReadTotalOut = contentBytesRead;
         return false;
       }
       delay(2);
@@ -771,13 +836,76 @@ bool readHttpBodyWithTimeout(HTTPClient &http, String &bodyOut, unsigned long st
     int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
     if (n <= 0) continue;
 
-    bodyOut.concat((const char*)buf, (size_t)n);
     lastDataAt = millis();
+    if (!chunked) {
+      for (int i = 0; i < n; i++) writeDecoded(buf[i]);
+      continue;
+    }
+
+    for (int i = 0; i < n; i++) {
+      char c = (char)buf[i];
+      if (chunkState == CHUNK_SIZE) {
+        if (c == '\n') {
+          size_t parsed = 0;
+          if (!parseChunkSizeLine(chunkLine, parsed)) {
+            if (out) out.close();
+            bytesReadTotalOut = contentBytesRead;
+            return false;
+          }
+          chunkLine = "";
+          chunkBytesRemaining = parsed;
+          chunkState = (chunkBytesRemaining == 0) ? CHUNK_TRAILERS : CHUNK_DATA;
+        } else if (c != '\r') {
+          chunkLine += c;
+        }
+      } else if (chunkState == CHUNK_DATA) {
+        writeDecoded((uint8_t)c);
+        if (--chunkBytesRemaining == 0) chunkState = CHUNK_DATA_CR;
+      } else if (chunkState == CHUNK_DATA_CR) {
+        if (c != '\r') {
+          if (out) out.close();
+          bytesReadTotalOut = contentBytesRead;
+          return false;
+        }
+        chunkState = CHUNK_DATA_LF;
+      } else if (chunkState == CHUNK_DATA_LF) {
+        if (c != '\n') {
+          if (out) out.close();
+          bytesReadTotalOut = contentBytesRead;
+          return false;
+        }
+        chunkState = CHUNK_SIZE;
+      } else if (chunkState == CHUNK_TRAILERS) {
+        if (c == '\n') {
+          if (chunkLine.length() == 0) {
+            completeOut = true;
+            if (out) out.close();
+            bytesReadTotalOut = contentBytesRead;
+            return true;
+          }
+          chunkLine = "";
+        } else if (c != '\r') {
+          chunkLine += c;
+        }
+      }
+    }
   }
 
-  if (expectedLength > 0 && bodyOut.length() != (size_t)expectedLength) {
+  if (chunked) {
+    completeOut = (chunkState == CHUNK_TRAILERS && chunkLine.length() == 0);
+  } else {
+    completeOut = true;
+  }
+
+  if (expectedLength > 0 && contentBytesRead != (size_t)expectedLength) {
+    if (out) out.close();
+    bytesReadTotalOut = contentBytesRead;
     return false;
   }
+
+  if (out) out.close();
+  bytesReadTotalOut = contentBytesRead;
+  if (chunked && !completeOut) return false;
   return true;
 }
 
@@ -1700,14 +1828,22 @@ bool fetchOshaState(OshaState &stateOut) {
     String lowerCt = contentType;
     lowerCt.toLowerCase();
 
+    if (sdMounted) ensureDirectory("/cache");
     String payload;
-    if (!readHttpBodyWithTimeout(http, payload, 20000)) {
-      Serial.println("OSHA: API body read failed or timed out");
-      appendDeviceLog("OSHA poll failed: timed out reading API response body");
-      persistParseFailureArtifacts(payload, "read-timeout-or-truncated");
+    bool bodyComplete = false;
+    size_t bytesReadTotal = 0;
+    if (!readHttpBodyWithTimeout(http, payload, "/cache/incidents.json", 20000, 90000, bodyComplete, bytesReadTotal)) {
+      Serial.printf("OSHA: API body read failed or timed out (bytes=%u complete=%d)\n",
+                    (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
+      appendDeviceLog("OSHA poll failed: body read timeout/truncated bytes=%u complete=%d",
+                      (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
       http.end();
       return false;
     }
+    Serial.printf("OSHA: API body read complete bytes=%u complete=%d\n",
+                  (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
+    appendDeviceLog("OSHA poll body read bytes=%u complete=%d",
+                    (unsigned int)bytesReadTotal, bodyComplete ? 1 : 0);
     logHttpResponseMeta(url, http, code, readMode, requestStartedAt, firstByteAt, tlsInsecure);
     Serial.printf("OSHA: API page payload bytes=%u\n", (unsigned int)payload.length());
     saveIncidentDebugFile("incident-last.json", payload);
