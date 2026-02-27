@@ -126,7 +126,9 @@ size_t galleryBytesWritten = 0;
 
 bool oshaEnabled = false;
 String oshaToken = "";
-String oshaBaseUrl = "https://api.incident.io/v2/incidents";
+// Default to the Google Sheets CSV export of the Incident/Violation responses.
+// This can be overridden via the /osha/config endpoint in the UI.
+String oshaBaseUrl = "https://docs.google.com/spreadsheets/d/1HSu8jtdgCA1Bf75Zhzs4cJJOY3ejbNNd1hWHUU8mYEw/export?format=csv";
 String oshaSelfInflictedFieldId = "01JZ0PNKHCB3M6NX0AHPABS59D";
 String oshaSelfInflictedOneOf = "01JZ0PNKHC4Y48M2RS8BADQYR2,01JZ0PNKHC55GCAZH5RJDDK54K,01K239XGE8XWCS50513AGVFVCA";
 
@@ -1115,7 +1117,7 @@ void setupWiFi(void) {
   sleepHours = preferences.getUInt("sleepHours", 24);
   oshaEnabled = preferences.getBool("osha_enabled", false);
   oshaToken = preferences.getString("osha_token", "");
-  oshaBaseUrl = preferences.getString("osha_url", "https://api.incident.io/v2/incidents");
+  oshaBaseUrl = preferences.getString("osha_url", "https://docs.google.com/spreadsheets/d/1HSu8jtdgCA1Bf75Zhzs4cJJOY3ejbNNd1hWHUU8mYEw/export?format=csv");
   preferences.end();
 
   if (savedSSID.length() > 0) {
@@ -1864,7 +1866,123 @@ bool saveIncidentDebugFile(const String &name, const String &content) {
 }
 
 bool fetchOshaState(OshaState &stateOut) {
-  if (!oshaEnabled || oshaToken.length() == 0 || WiFi.status() != WL_CONNECTED) return false;
+  // OSHA mode must be enabled and WiFi must be connected.  The API token is
+  // only required when talking to the incident.io API; it is not needed for
+  // the Google Sheets CSV endpoint.
+  if (!oshaEnabled || WiFi.status() != WL_CONNECTED) return false;
+
+  // If the configured URL points at a Google Sheets CSV export, fetch and
+  // parse it directly.  The expected format is: Timestamp, Incident Number,
+  // Date of Incident/Violation, Violation Description.  The function will
+  // compute the number of days since the most recent incident and the count
+  // of distinct prior days, and will map the violation description into one
+  // of the allowed OSHA categories (Deploy, Change, Missed Task).
+  if (oshaBaseUrl.indexOf("docs.google.com") >= 0) {
+    HTTPClient http;
+    http.setTimeout(15000);
+    if (!http.begin(oshaBaseUrl)) {
+      appendDeviceLog("OSHA poll failed: http begin failed for sheet");
+      return false;
+    }
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      // Log and abort on non-OK status; there is no recovery path here.
+      appendDeviceLog("OSHA poll failed: sheet HTTP %d", code);
+      http.end();
+      return false;
+    }
+    String csv = http.getString();
+    http.end();
+    if (csv.length() == 0) {
+      appendDeviceLog("OSHA poll failed: empty CSV");
+      return false;
+    }
+
+    std::vector<String> uniqueDates;
+    String latestDate = "";
+    String latestReason = "";
+    String latestIncidentId = "";
+    int pos = 0;
+    bool header = true;
+    while (pos < (int)csv.length()) {
+      int lineEnd = csv.indexOf('\n', pos);
+      String line = (lineEnd >= 0) ? csv.substring(pos, lineEnd) : csv.substring(pos);
+      pos = (lineEnd >= 0) ? (lineEnd + 1) : csv.length();
+      if (line.length() == 0) continue;
+      // Skip the header row (first non-empty line).
+      if (header) {
+        header = false;
+        continue;
+      }
+      // Split the line by commas into four columns.
+      int c1 = line.indexOf(',');
+      if (c1 < 0) continue;
+      int c2 = line.indexOf(',', c1 + 1);
+      if (c2 < 0) continue;
+      int c3 = line.indexOf(',', c2 + 1);
+      if (c3 < 0) continue;
+      String inc = line.substring(c1 + 1, c2);
+      String date = line.substring(c2 + 1, c3);
+      String classification = line.substring(c3 + 1);
+      inc.trim();
+      date.trim();
+      classification.trim();
+      if (date.length() == 0) continue;
+      // Convert a date like "2/26/2026" into "2026-02-26".
+      int s1 = date.indexOf('/');
+      int s2 = date.indexOf('/', s1 + 1);
+      if (s1 < 0 || s2 < 0) continue;
+      int month = date.substring(0, s1).toInt();
+      int day = date.substring(s1 + 1, s2).toInt();
+      int year = date.substring(s2 + 1).toInt();
+      char buf[11];
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d", year, month, day);
+      String isoDate = String(buf);
+      // Add the date to the set of unique dates if not already present.
+      bool seen = false;
+      for (auto &d : uniqueDates) {
+        if (d == isoDate) { seen = true; break; }
+      }
+      if (!seen) {
+        uniqueDates.push_back(isoDate);
+        if (latestDate.length() == 0) {
+          latestDate = isoDate;
+          latestReason = normalizeOshaCategory(classification);
+          latestIncidentId = inc;
+        }
+      }
+    }
+
+    if (latestDate.length() == 0) {
+      // No valid entries found; reset the OSHA state.
+      stateOut = {0,0,"","",""};
+    } else {
+      // Extract only digits from the incident identifier.
+      String digits = "";
+      for (size_t i = 0; i < latestIncidentId.length(); i++) {
+        if (isdigit(latestIncidentId[i])) digits += latestIncidentId[i];
+      }
+      int priorCount = max(0, (int)uniqueDates.size() - 1);
+      int daysDiff = daysBetweenDates(latestDate, nyTodayDate());
+      stateOut.days = daysDiff;
+      stateOut.prior = priorCount;
+      stateOut.incident = digits;
+      stateOut.date = latestDate;
+      stateOut.reason = latestReason;
+      currentOshaState = stateOut;
+      oshaDays = stateOut.days;
+      oshaPrior = stateOut.prior;
+      oshaIncident = stateOut.incident;
+      oshaDate = stateOut.date;
+      oshaReason = stateOut.reason;
+      saveOshaStateToSd(stateOut);
+    }
+    return true;
+  }
+
+  // If not fetching from Google Sheets, require a valid API token to query
+  // the incident.io API.
+  if (oshaToken.length() == 0) return false;
 
   std::vector<std::pair<time_t, String>> offenses;
   std::vector<String> allowedValues;
