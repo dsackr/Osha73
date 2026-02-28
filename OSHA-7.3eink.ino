@@ -1760,9 +1760,9 @@ void handleRawImagesUpload() {
       return;
     }
 
-    String requestedName = server.arg("name");
-    if (requestedName.length() == 0) requestedName = up.filename;
-    galleryUploadName = sanitizeGalleryFileName(requestedName);
+    // Avoid relying on query args from the upload callback context.
+    // The client already sends a sanitized filename in the multipart part.
+    galleryUploadName = sanitizeGalleryFileName(up.filename);
     galleryUploadPath = "/gallery/" + galleryUploadName;
 
     if (SD.exists(galleryUploadPath.c_str())) SD.remove(galleryUploadPath.c_str());
