@@ -634,6 +634,14 @@ bool downloadFileToSd(const char *url, const char *destPath) {
   }
 
   WiFiClient *stream = http.getStreamPtr();
+  if (!stream) {
+    logSdSetup("download stream unavailable for %s", url);
+    out.close();
+    SD.remove(destPath);
+    http.end();
+    return false;
+  }
+
   uint8_t buf[1024];
   size_t totalWritten = 0;
   unsigned long startedAt = millis();
@@ -671,7 +679,16 @@ bool downloadFileToSd(const char *url, const char *destPath) {
 
     int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
     if (n <= 0) break;
-    out.write(buf, (size_t)n);
+
+    size_t written = out.write(buf, (size_t)n);
+    if (written != (size_t)n) {
+      logSdSetup("download write short for %s (expected=%d, wrote=%u)",
+                 destPath, n, (unsigned int)written);
+      out.close();
+      SD.remove(destPath);
+      http.end();
+      return false;
+    }
     totalWritten += (size_t)n;
 
     unsigned long now = millis();
@@ -1469,6 +1486,10 @@ bool fetchOshaState(OshaState &stateOut) {
       }
 
       if (code == HTTP_CODE_OK) {
+        int expectedLength = http.getSize();
+        if (expectedLength > 0) {
+          csv.reserve((size_t)expectedLength + 1);
+        }
         csv = http.getString();
         http.end();
         break;
@@ -1499,6 +1520,10 @@ bool fetchOshaState(OshaState &stateOut) {
       return false;
     }
 
+    int expectedLength = http.getSize();
+    if (expectedLength > 0) {
+      csv.reserve((size_t)expectedLength + 1);
+    }
     csv = http.getString();
     http.end();
   }
