@@ -1382,10 +1382,10 @@ bool fetchOshaState(OshaState &stateOut) {
   auto isRedirectCode = [](int code) {
     return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
   };
-  auto truncateUrl = [](const String &url) {
+  auto truncateUrl = [](const String &url) -> String {
     const size_t maxLen = 160;
     if (url.length() <= maxLen) return url;
-    return url.substring(0, maxLen) + "...";
+    return url.substring(0, maxLen) + String("...");
   };
 
   if (isGoogleSheetCsv) {
