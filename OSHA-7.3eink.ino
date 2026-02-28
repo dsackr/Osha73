@@ -1359,22 +1359,117 @@ bool fetchOshaState(OshaState &stateOut) {
   if (!oshaEnabled || WiFi.status() != WL_CONNECTED) return false;
   if (oshaSheetUrl.length() == 0) return false;
 
-  HTTPClient http;
-  http.setTimeout(15000);
-  if (!http.begin(oshaSheetUrl)) {
-    appendDeviceLog("OSHA poll failed: unable to start request");
-    return false;
-  }
+  String csv = "";
+  const bool isGoogleSheetCsv = oshaSheetUrl.indexOf("docs.google.com") >= 0 && oshaSheetUrl.indexOf("format=csv") >= 0;
+  auto isRedirectCode = [](int code) {
+    return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+  };
+  auto truncateUrl = [](const String &url) {
+    const size_t maxLen = 160;
+    if (url.length() <= maxLen) return url;
+    return url.substring(0, maxLen) + "...";
+  };
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    appendDeviceLog("OSHA poll failed: sheet HTTP %d", code);
+  if (isGoogleSheetCsv) {
+    String requestUrl = oshaSheetUrl;
+    const char *headerKeys[] = {"Location"};
+
+    for (int hop = 0; hop < 3; hop++) {
+      HTTPClient http;
+      http.setTimeout(15000);
+      http.setReuse(false);
+#ifdef HTTPC_STRICT_FOLLOW_REDIRECTS
+      http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+#elif defined(HTTPC_FORCE_FOLLOW_REDIRECTS)
+      http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+#endif
+      http.collectHeaders(headerKeys, 1);
+
+      if (!http.begin(requestUrl)) {
+        appendDeviceLog("OSHA poll failed: unable to start Google sheet request");
+        Serial.println("OSHA poll failed: unable to start Google sheet request");
+        return false;
+      }
+
+      int code = http.GET();
+      String location = http.header("Location");
+      appendDeviceLog("OSHA sheet GET hop %d HTTP %d", hop + 1, code);
+      Serial.printf("OSHA sheet GET hop %d HTTP %d\n", hop + 1, code);
+
+      if (isRedirectCode(code)) {
+        String shortLoc = truncateUrl(location);
+        appendDeviceLog("OSHA sheet redirect hop %d -> %s", hop + 1, shortLoc.c_str());
+        Serial.printf("OSHA sheet redirect hop %d -> %s\n", hop + 1, shortLoc.c_str());
+
+        if (location.indexOf("accounts.google.com") >= 0 || location.indexOf("ServiceLogin") >= 0 || location.indexOf("consent") >= 0) {
+          appendDeviceLog("OSHA poll failed: Google Sheet may not be publicly accessible (redirected to login/consent)");
+          Serial.println("OSHA poll failed: Google Sheet may not be publicly accessible (redirected to login/consent)");
+          http.end();
+          return false;
+        }
+
+        if (location.length() == 0) {
+          appendDeviceLog("OSHA poll failed: redirect without Location header");
+          Serial.println("OSHA poll failed: redirect without Location header");
+          http.end();
+          return false;
+        }
+
+        http.end();
+
+        if (location.startsWith("http://") || location.startsWith("https://")) {
+          requestUrl = location;
+        } else {
+          int schemePos = requestUrl.indexOf("://");
+          int hostStart = (schemePos >= 0) ? schemePos + 3 : 0;
+          int pathPos = requestUrl.indexOf('/', hostStart);
+          String origin = (pathPos >= 0) ? requestUrl.substring(0, pathPos) : requestUrl;
+          requestUrl = location.startsWith("/") ? (origin + location) : (origin + "/" + location);
+        }
+
+        if (hop == 2) {
+          appendDeviceLog("OSHA poll failed: too many redirects while fetching Google sheet");
+          Serial.println("OSHA poll failed: too many redirects while fetching Google sheet");
+          return false;
+        }
+        continue;
+      }
+
+      if (code == HTTP_CODE_OK) {
+        csv = http.getString();
+        http.end();
+        break;
+      }
+
+      if (code == HTTP_CODE_UNAUTHORIZED || code == HTTP_CODE_FORBIDDEN) {
+        appendDeviceLog("OSHA poll failed: Google Sheet may not be publicly accessible (HTTP %d)", code);
+        Serial.printf("OSHA poll failed: Google Sheet may not be publicly accessible (HTTP %d)\n", code);
+      } else {
+        appendDeviceLog("OSHA poll failed: sheet HTTP %d", code);
+        Serial.printf("OSHA poll failed: sheet HTTP %d\n", code);
+      }
+      http.end();
+      return false;
+    }
+  } else {
+    HTTPClient http;
+    http.setTimeout(15000);
+    if (!http.begin(oshaSheetUrl)) {
+      appendDeviceLog("OSHA poll failed: unable to start request");
+      return false;
+    }
+
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      appendDeviceLog("OSHA poll failed: sheet HTTP %d", code);
+      http.end();
+      return false;
+    }
+
+    csv = http.getString();
     http.end();
-    return false;
   }
 
-  String csv = http.getString();
-  http.end();
   if (csv.length() == 0) {
     appendDeviceLog("OSHA poll failed: empty CSV");
     return false;
