@@ -171,7 +171,16 @@ static size_t imageBytesWritten = 0;
 static bool displayUploadFailed = false;
 static String displayUploadError = "";
 
+static bool galleryUploadInProgress = false;
+static bool galleryUploadFailed = false;
+static String galleryUploadError = "";
+static String galleryUploadName = "";
+static String galleryUploadPath = "";
+static size_t galleryBytesReceived = 0;
+static size_t galleryExpectedTotal = 0;
+
 File currentImageFile;
+File galleryUploadFile;
 
 // ================= Forward declarations =================
 void SPI_Write(unsigned char value);
@@ -187,6 +196,7 @@ void handleSdSetupPage();
 void handleSdSetupRun();
 String sanitizeGalleryFileName(const String &name);
 void handleRawImagesUpload();
+void handleRawImagesUploadDone();
 void handleImagesList();
 void handleImagesDelete();
 void handleDisplayShow();
@@ -1617,43 +1627,105 @@ void handleUiRefresh() {
 }
 
 void handleRawImagesUpload() {
-  logWebRequest("handleRawImagesUpload");
-  if (!sdMounted) { server.send(500, "application/json", "{\"error\":\"sd unavailable\"}"); return; }
-  String name = sanitizeGalleryFileName(server.hasArg("name") ? server.arg("name") : "");
-  String fullPath = "/gallery/" + name;
-  if (SD.exists(fullPath.c_str())) SD.remove(fullPath.c_str());
+  HTTPUpload &up = server.upload();
 
-  File out = SD.open(fullPath.c_str(), FILE_WRITE);
-  if (!out) { server.send(500, "application/json", "{\"error\":\"open failed\"}"); return; }
+  if (up.status == UPLOAD_FILE_START) {
+    logWebRequest("handleRawImagesUpload:UPLOAD_FILE_START");
 
-  WiFiClient client = server.client();
-  int remaining = server.contentLength();
-  if (remaining <= 0) {
-    out.close();
-    SD.remove(fullPath.c_str());
-    server.send(400, "application/json", "{\"error\":\"missing content\"}");
+    galleryUploadInProgress = false;
+    galleryUploadFailed = false;
+    galleryUploadError = "";
+    galleryBytesReceived = 0;
+    galleryExpectedTotal = up.totalSize;
+    if (galleryUploadFile) galleryUploadFile.close();
+
+    if (!sdMounted) {
+      galleryUploadFailed = true;
+      galleryUploadError = "sd unavailable";
+      return;
+    }
+
+    String requestedName = server.hasArg("name") ? server.arg("name") : up.filename;
+    galleryUploadName = sanitizeGalleryFileName(requestedName);
+    galleryUploadPath = "/gallery/" + galleryUploadName;
+
+    if (SD.exists(galleryUploadPath.c_str())) SD.remove(galleryUploadPath.c_str());
+
+    galleryUploadFile = SD.open(galleryUploadPath.c_str(), FILE_WRITE);
+    if (!galleryUploadFile) {
+      galleryUploadFailed = true;
+      galleryUploadError = "open failed";
+      return;
+    }
+
+    galleryUploadInProgress = true;
+    if (galleryExpectedTotal > 0) {
+      Serial.printf("WEB: gallery upload start file=%s total=%u\n", galleryUploadName.c_str(), (unsigned int)galleryExpectedTotal);
+    } else {
+      Serial.printf("WEB: gallery upload start file=%s total=unknown\n", galleryUploadName.c_str());
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!galleryUploadInProgress || galleryUploadFailed) return;
+
+    size_t wrote = galleryUploadFile.write(up.buf, up.currentSize);
+    galleryBytesReceived += up.currentSize;
+    if (wrote != up.currentSize) {
+      galleryUploadFailed = true;
+      galleryUploadError = "write failed";
+      return;
+    }
+
+    if (galleryExpectedTotal > 0) {
+      int pct = (int)((galleryBytesReceived * 100UL) / galleryExpectedTotal);
+      Serial.printf("WEB: gallery upload progress %u/%u (%d%%)\n", (unsigned int)galleryBytesReceived, (unsigned int)galleryExpectedTotal, pct);
+    } else {
+      Serial.printf("WEB: gallery upload progress %u bytes\n", (unsigned int)galleryBytesReceived);
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!galleryUploadInProgress) return;
+
+    galleryUploadFile.flush();
+    galleryUploadFile.close();
+    galleryUploadInProgress = false;
+
+    if (galleryBytesReceived != EPD_BUFFER_SIZE) {
+      galleryUploadFailed = true;
+      galleryUploadError = "invalid size";
+      SD.remove(galleryUploadPath.c_str());
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Serial.println("WEB: gallery upload aborted");
+    galleryUploadFailed = true;
+    galleryUploadError = "upload aborted";
+    galleryUploadInProgress = false;
+    if (galleryUploadFile) galleryUploadFile.close();
+    if (galleryUploadPath.length() > 0 && SD.exists(galleryUploadPath.c_str())) SD.remove(galleryUploadPath.c_str());
+  }
+}
+
+void handleRawImagesUploadDone() {
+  logWebRequest("handleRawImagesUploadDone");
+
+  if (galleryUploadInProgress && galleryUploadFile) {
+    galleryUploadFile.flush();
+    galleryUploadFile.close();
+    galleryUploadInProgress = false;
+  }
+
+  if (galleryUploadFailed) {
+    int code = (galleryUploadError == "sd unavailable" || galleryUploadError == "open failed" || galleryUploadError == "write failed") ? 500 : 400;
+    String json = String("{\"error\":\"") + galleryUploadError + "\"}";
+    server.send(code, "application/json", json);
     return;
   }
 
-  uint8_t buf[1024];
-  size_t written = 0;
-  while (remaining > 0) {
-    int n = client.readBytes((char*)buf, min((int)sizeof(buf), remaining));
-    if (n <= 0) break;
-    out.write(buf, n);
-    written += (size_t)n;
-    remaining -= n;
-  }
-  out.flush();
-  out.close();
-
-  if (written != EPD_BUFFER_SIZE) {
-    SD.remove(fullPath.c_str());
+  if (galleryBytesReceived != EPD_BUFFER_SIZE) {
+    if (galleryUploadPath.length() > 0 && SD.exists(galleryUploadPath.c_str())) SD.remove(galleryUploadPath.c_str());
     server.send(400, "application/json", "{\"error\":\"invalid size\"}");
     return;
   }
 
-  String json = String("{\"status\":\"ok\",\"name\":\"") + name + "\"}";
+  String json = String("{\"status\":\"ok\",\"name\":\"") + galleryUploadName + "\"}";
   server.send(200, "application/json", json);
 }
 
@@ -1743,7 +1815,7 @@ void setupWebServer() {
   server.on("/extend", HTTP_POST, handleExtend);
   server.on("/sleepconfig", HTTP_POST, handleSleepConfig);
   server.on("/shutdown", HTTP_GET, handleShutdown);
-  server.on("/images/upload", HTTP_POST, handleRawImagesUpload);
+  server.on("/images/upload", HTTP_POST, handleRawImagesUploadDone, handleRawImagesUpload);
   server.on("/images/list", HTTP_GET, handleImagesList);
   server.on("/images/delete", HTTP_POST, handleImagesDelete);
   server.on("/display/show", HTTP_POST, handleDisplayShow);
