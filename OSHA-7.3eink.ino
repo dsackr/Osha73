@@ -202,7 +202,6 @@ void handleImagesDelete();
 void handleDisplayShow();
 void handleOshaRefresh();
 void handleOshaConfig();
-void handleLogs();
 void handleUiRefresh();
 bool refreshOshaAndMaybeDisplay(bool forceDisplay);
 bool renderOshaDisplay(const OshaState &state);
@@ -1808,7 +1807,6 @@ void setupWebServer() {
   server.on("/wifi/clear", HTTP_POST, handleClearWiFi);
 
   server.on("/status", HTTP_GET, handleStatus);
-  server.on("/logs", HTTP_GET, handleLogs);
   server.on("/sd/setup", HTTP_GET, handleSdSetupPage);
   server.on("/sd/setup/run", HTTP_POST, handleSdSetupRun);
   server.on("/session", HTTP_GET, handleSession);
