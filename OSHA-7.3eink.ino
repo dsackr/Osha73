@@ -1159,8 +1159,9 @@ void handleUploadStream() {
     imageExpectedTotal = up.totalSize;
     displayUploadEnded = false;
 
-    String requestedName = server.arg("name");
-    if (requestedName.length() == 0) requestedName = up.filename;
+    // Avoid relying on query args from upload callback context on ESP32-C6.
+    // The multipart filename is already available and safer to consume here.
+    String requestedName = up.filename;
     maybeOpenSDForSave(requestedName);
 
     if (imageExpectedTotal > 0) {
@@ -1176,6 +1177,18 @@ void handleUploadStream() {
 
     const uint8_t *buf = up.buf;
     size_t n = up.currentSize;
+    if (n > 0 && buf == nullptr) {
+      displayUploadFailed = true;
+      displayUploadError = "upload buffer missing";
+      uploadInProgress = false;
+      displayUploadEnded = false;
+      displayBusy = false;
+      if (currentImageFile) {
+        currentImageFile.flush();
+        currentImageFile.close();
+      }
+      return;
+    }
 
     for (size_t i = 0; i < n && imageBytesWritten < EPD_BUFFER_SIZE; i++) {
       uint8_t byteIn = buf[i];
@@ -1782,6 +1795,14 @@ void handleRawImagesUpload() {
     }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (!galleryUploadInProgress || galleryUploadFailed) return;
+    if (up.currentSize > 0 && up.buf == nullptr) {
+      galleryUploadFailed = true;
+      galleryUploadError = "upload buffer missing";
+      galleryUploadInProgress = false;
+      if (galleryUploadFile) galleryUploadFile.close();
+      if (galleryUploadPath.length() > 0 && SD.exists(galleryUploadPath.c_str())) SD.remove(galleryUploadPath.c_str());
+      return;
+    }
 
     size_t wrote = galleryUploadFile.write(up.buf, up.currentSize);
     galleryBytesReceived += up.currentSize;
