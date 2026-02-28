@@ -2,431 +2,104 @@
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>E-Paper</title>
+<title>E-Paper UI</title>
 <style>
-body{font-family:Arial;margin:0;background:#0f172a;color:#e5e7eb}
-.container{max-width:900px;margin:0 auto;padding:20px}
-h1{text-align:center;color:#f97316}
-.card{background:#111827;padding:20px;border-radius:10px;margin-bottom:16px}
-label{display:block;margin:10px 0 6px;font-weight:bold}
-input[type=file],input[type=text],input[type=password],input[type=number]{width:100%;padding:10px;border-radius:6px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
-button{padding:12px 18px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px}
-button:disabled{opacity:.6;cursor:not-allowed}
-.row{display:flex;gap:10px;flex-wrap:wrap}
-.row button{flex:1}
-.small{color:#9ca3af;font-size:13px;line-height:1.4}
-.file-row{display:flex;justify-content:space-between;align-items:center;background:#0b1220;border:1px solid #1f2937;border-radius:6px;padding:8px 10px;margin-bottom:8px;gap:8px}
-.file-row .meta{font-size:12px;color:#9ca3af}
+body{font-family:Arial;margin:0;background:#0f172a;color:#e5e7eb}.container{max-width:920px;margin:0 auto;padding:20px}
+.card{background:#111827;padding:16px;border-radius:10px;margin-bottom:14px}h1{text-align:center;color:#f97316}
+label{display:block;margin:8px 0 6px;font-weight:bold}input[type=file],input[type=text],input[type=number]{width:100%;padding:10px;border-radius:6px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
+button{padding:10px 14px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer}.row{display:flex;gap:10px;flex-wrap:wrap}.row button{flex:1}
+.small{font-size:13px;color:#9ca3af}.item{display:flex;justify-content:space-between;gap:8px;align-items:center;background:#0b1220;border:1px solid #1f2937;border-radius:8px;padding:8px;margin-bottom:8px}
+.progress{height:10px;background:#1f2937;border-radius:999px;overflow:hidden}.bar{height:10px;background:#22c55e;width:0%}
 </style>
 </head>
-<body>
-<div class="container">
+<body><div class="container">
 <h1>E-Paper</h1>
+<div class="card"><p id="status">Ready.</p><p id="info">Loading status...</p><p id="timer">Loading session timer...</p>
+<div class="row"><button id="extendBtn">+5 minutes</button><button id="shutdownBtn" style="background:#dc2626">Shutdown now</button></div></div>
 
 <div class="card">
-  <p class="muted" id="status">Ready.</p>
-  <p class="muted" id="info">Loading status...</p>
-  <p class="muted" id="timer">Loading session timer...</p>
-  <div class="row" style="margin-top:10px">
-    <button id="extendBtn">+5 minutes</button>
-    <button id="shutdownBtn" style="background:#dc2626">Shutdown now</button>
-  </div>
-  <p class="small">STA mode auto-shutdown at timer end. AP mode stays on.</p>
+<label>Auto-refresh interval (hours)</label><input type="number" id="sleepHours" min="1" max="168" value="24">
+<div class="row" style="margin-top:10px"><button id="saveSleepBtn">Save Interval</button></div>
+<p class="small">OSHA mode enforces max 24h. Photo mode allows 1-168h.</p>
 </div>
 
 <div class="card">
-  <label>Pull URL (Pi endpoint)</label>
-  <input type="text" id="pullUrl" placeholder="http://pi-zero.local:8080/latest.bin">
-  <div class="row" style="margin-top:12px">
-    <button id="savePullBtn">Save Pull URL</button>
-  </div>
-  <p class="small">Pull URL can be used for manual image workflows.</p>
-  
-  <label style="margin-top:20px">Auto-refresh interval (hours)</label>
-  <input type="number" id="sleepHours" min="1" max="168" value="24">
-  <div class="row" style="margin-top:12px">
-    <button id="saveSleepBtn">Save Interval</button>
-  </div>
-  <p class="small">When OSHA mode is ON, max interval is 24h. In Picture mode, 1-168h is allowed.</p>
+<h2>Display Mode</h2>
+<label><input type="checkbox" id="oshaEnabled"> OSHA mode</label>
+<label>Google Sheet CSV URL</label><input type="text" id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/.../export?format=csv">
+<div class="row" style="margin-top:10px"><button id="saveOshaBtn">Save Display Mode</button><button id="refreshOshaBtn" style="background:#16a34a">Run OSHA refresh now</button></div>
+<p class="small">Last OSHA: <span id="oshaDays">0</span> days, <span id="oshaPrior">0</span> prior, incident <span id="oshaIncident"></span>, <span id="oshaDate"></span>, <span id="oshaReason"></span>.</p>
 </div>
 
 <div class="card">
-  <label>Choose image (manual override)</label>
-  <input type="file" id="fileInput" accept="image/*">
-  <label>Optional name to save (SD)</label>
-  <input type="text" id="imageName" placeholder="Optional name to save (letters/numbers/_/-)">
-  <div class="row" style="margin-top:12px">
-    <button id="sendBtn">Convert + Upload (binary)</button>
-  </div>
+<h2>Photo mode upload</h2>
+<label>Image file</label><input type="file" id="fileInput" accept="image/*">
+<label>Optional library name</label><input type="text" id="imageName" placeholder="example-image">
+<button id="uploadBtn" style="margin-top:10px">Upload to Library</button>
+<p id="progressLabel" class="small">Idle</p><div class="progress"><div id="progressBar" class="bar"></div></div>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Display Mode</h2>
-  <label><input type="checkbox" id="oshaEnabled"> OSHA mode (unchecked = Picture mode)</label>
-  <label>Incident.io API token</label>
-  <input type="password" id="oshaToken" placeholder="Bearer token">
-  <div class="row" style="margin-top:12px">
-    <button id="saveOshaBtn">Save Display Mode</button>
-    <button id="refreshOshaBtn" style="background:#16a34a">Run OSHA refresh now</button>
-  </div>
-  <p class="small">If OSHA mode is enabled but no API key is saved, boot screen will show setup instructions.</p>
-  <p class="small">Last OSHA status: <span id="oshaDays">0</span> days, <span id="oshaPrior">0</span> prior, <span id="oshaIncident"></span> (<span id="oshaDate"></span>), <span id="oshaReason"></span></p>
+<h2>Library</h2>
+<div id="library"></div>
 </div>
-
-<div class="card">
-  <h2 style="margin-top:0">SD Card Browser</h2>
-  <p class="small">Browse, upload, create folders, and delete files/folders on the SD card.</p>
-  <div class="row" style="margin-top:12px">
-    <input type="text" id="sdPath" value="/" placeholder="/">
-    <button id="sdRefreshBtn">Refresh</button>
-  </div>
-  <div class="row" style="margin-top:12px">
-    <input type="file" id="sdUploadFile">
-    <button id="sdUploadBtn">Upload File</button>
-  </div>
-  <div class="row" style="margin-top:12px">
-    <input type="text" id="sdMkdirName" placeholder="new-folder-name">
-    <button id="sdMkdirBtn">Create Folder</button>
-  </div>
-  <p class="small"><a href="/logs" target="_blank" style="color:#93c5fd">Open device logs</a></p>
-  <div id="sdList"></div>
-</div>
-
-
 
 <script>
-// Elements
-var statusEl=document.getElementById('status');
-var infoEl=document.getElementById('info');
-var timerEl=document.getElementById('timer');
-
-var extendBtn=document.getElementById('extendBtn');
-var shutdownBtn=document.getElementById('shutdownBtn');
-
-var pullUrlEl=document.getElementById('pullUrl');
-var savePullBtn=document.getElementById('savePullBtn');
-var sleepHoursEl=document.getElementById('sleepHours');
-var saveSleepBtn=document.getElementById('saveSleepBtn');
-
-var sendBtn=document.getElementById('sendBtn');
-
-var oshaEnabledEl=document.getElementById('oshaEnabled');
-var oshaTokenEl=document.getElementById('oshaToken');
-var saveOshaBtn=document.getElementById('saveOshaBtn');
-var refreshOshaBtn=document.getElementById('refreshOshaBtn');
-var oshaDaysEl=document.getElementById('oshaDays');
-var oshaPriorEl=document.getElementById('oshaPrior');
-var oshaIncidentEl=document.getElementById('oshaIncident');
-var oshaDateEl=document.getElementById('oshaDate');
-var oshaReasonEl=document.getElementById('oshaReason');
-var sdPathEl=document.getElementById('sdPath');
-var sdRefreshBtn=document.getElementById('sdRefreshBtn');
-var sdUploadFileEl=document.getElementById('sdUploadFile');
-var sdUploadBtn=document.getElementById('sdUploadBtn');
-var sdMkdirNameEl=document.getElementById('sdMkdirName');
-var sdMkdirBtn=document.getElementById('sdMkdirBtn');
-var sdListEl=document.getElementById('sdList');
-
-var EPD_WIDTH=800;
-var EPD_HEIGHT=480;
-var EPD_BUFFER_SIZE=EPD_WIDTH*EPD_HEIGHT/2;
-
-function logStatus(m){statusEl.textContent=m;}
-function logInfo(m){infoEl.textContent=m;}
-
-var msLeft=0;
-var lastTick=Date.now();
-var statusPollTimer=null;
-var sessionPollTimer=null;
-var statusPollInFlight=false;
-var sessionPollInFlight=false;
-var STATUS_POLL_MS=15000;
-var SESSION_POLL_MS=10000;
+const $=id=>document.getElementById(id);const statusEl=$('status'),infoEl=$('info'),timerEl=$('timer');
+const sleepHoursEl=$('sleepHours'),oshaEnabledEl=$('oshaEnabled'),sheetUrlEl=$('sheetUrl');
+const oshaDaysEl=$('oshaDays'),oshaPriorEl=$('oshaPrior'),oshaIncidentEl=$('oshaIncident'),oshaDateEl=$('oshaDate'),oshaReasonEl=$('oshaReason');
+let msLeft=0,lastTick=Date.now();
+function setStatus(t){statusEl.textContent=t} function setInfo(t){infoEl.textContent=t}
 
 async function fetchStatus(){
-  if(statusPollInFlight) return;
-  statusPollInFlight=true;
-  try{
-    var res=await fetch('/status');
-    var d=await res.json();
-    var modeLabel = d.osha_enabled ? 'OSHA' : 'Picture';
-    var tokenLabel = d.osha_token_configured ? 'configured' : 'missing';
-    logInfo('SSID: '+d.ssid+' | IP: '+d.ip+' | Battery: '+d.battery_percent+'% ('+d.battery_voltage+' V) | '+d.battery_state+' ('+d.battery_crate_pct_per_hr+' %/hr) | Mode: '+modeLabel+' | API key: '+tokenLabel);
-    if(document.activeElement !== pullUrlEl){
-      pullUrlEl.value = d.pull_url || '';
-    }
-    if(document.activeElement !== sleepHoursEl){
-      sleepHoursEl.value = d.sleep_hours || 24;
-    }
-    // OSHA state fields if provided
-    if(typeof d.osha_enabled !== 'undefined'){
-      oshaEnabledEl.checked = !!d.osha_enabled;
-    }
-    if(typeof d.osha_days !== 'undefined'){
-      oshaDaysEl.textContent = d.osha_days;
-    }
-    if(typeof d.osha_prior !== 'undefined'){
-      oshaPriorEl.textContent = d.osha_prior;
-    }
-    if(typeof d.osha_incident !== 'undefined'){
-      oshaIncidentEl.textContent = d.osha_incident;
-    }
-    if(typeof d.osha_date !== 'undefined'){
-      oshaDateEl.textContent = d.osha_date;
-    }
-    if(typeof d.osha_reason !== 'undefined'){
-      oshaReasonEl.textContent = d.osha_reason;
-    }
-  }catch(e){
-    logInfo('Unable to load status');
-  }finally{
-    statusPollInFlight=false;
-  }
+  try{const d=await (await fetch('/status')).json();
+    setInfo(`SSID: ${d.ssid} | IP: ${d.ip} | Battery: ${d.battery_percent}% (${d.battery_voltage}V) | ${d.battery_state} | Mode: ${d.mode}`);
+    if(document.activeElement!==sleepHoursEl) sleepHoursEl.value=d.sleep_hours||24;
+    if(document.activeElement!==sheetUrlEl) sheetUrlEl.value=d.sheet_url||'';
+    oshaEnabledEl.checked=!!d.osha_enabled; oshaDaysEl.textContent=d.osha_days??0; oshaPriorEl.textContent=d.osha_prior??0;
+    oshaIncidentEl.textContent=d.osha_incident||''; oshaDateEl.textContent=d.osha_date||''; oshaReasonEl.textContent=d.osha_reason||'';
+  }catch(e){setInfo('Unable to load status')}
 }
+async function fetchSession(){try{const d=await (await fetch('/session')).json();msLeft=d.ms_left||0;lastTick=Date.now()}catch(e){}}
+setInterval(()=>{const cur=Math.max(0,msLeft-(Date.now()-lastTick));const s=Math.floor(cur/1000);timerEl.textContent=`Wi-Fi window: ${Math.floor(s/60)}:${String(s%60).padStart(2,'0')} remaining`;},250);
+setInterval(fetchStatus,15000); setInterval(fetchSession,10000);
 
-async function fetchSession(){
-  if(sessionPollInFlight) return;
-  sessionPollInFlight=true;
-  try{
-    var res=await fetch('/session');
-    var d=await res.json();
-    msLeft = d.ms_left || 0;
-    lastTick = Date.now();
-  }catch(e){}
-  finally{
-    sessionPollInFlight=false;
-  }
-}
-
-function schedulePolling(){
-  if(statusPollTimer) clearInterval(statusPollTimer);
-  if(sessionPollTimer) clearInterval(sessionPollTimer);
-  statusPollTimer=setInterval(fetchStatus, STATUS_POLL_MS);
-  sessionPollTimer=setInterval(fetchSession, SESSION_POLL_MS);
-}
-
-setInterval(function(){
-  var dt = Date.now() - lastTick;
-  var cur = Math.max(0, msLeft - dt);
-  var s = Math.floor(cur/1000);
-  var mm = Math.floor(s/60);
-  var ss = String(s%60).padStart(2,'0');
-  timerEl.textContent = 'Wi-Fi window: '+mm+':'+ss+' remaining';
-}, 250);
-
-
-extendBtn.onclick = async function(){
-  await fetch('/extend?minutes=5', {method:'POST'});
-  await fetchSession();
+$('extendBtn').onclick=async()=>{await fetch('/extend?minutes=5',{method:'POST'});fetchSession();};
+$('shutdownBtn').onclick=async()=>{if(confirm('Shutdown now?')) await fetch('/shutdown');};
+$('saveSleepBtn').onclick=async()=>{
+  const h=parseInt(sleepHoursEl.value,10); if(isNaN(h)||h<1||h>168) return alert('Hours must be between 1 and 168');
+  if(oshaEnabledEl.checked&&h>24) return alert('OSHA mode max is 24h');
+  const r=await fetch('/sleepconfig',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hours='+h});
+  alert(r.ok?'Saved':'Failed'); fetchStatus();
 };
 
-shutdownBtn.onclick = async function(){
-  if(!confirm('Shutdown now (deep sleep forever)?')) return;
-  await fetch('/shutdown');
+$('saveOshaBtn').onclick=async()=>{
+  const body='enabled='+(oshaEnabledEl.checked?1:0)+'&sheet_url='+encodeURIComponent(sheetUrlEl.value.trim());
+  const r=await fetch('/osha/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+  alert(r.ok?'Saved':'Failed'); fetchStatus();
 };
+$('refreshOshaBtn').onclick=async()=>{const r=await fetch('/osha/refresh',{method:'POST'});alert(r.ok?'Refreshed':'Refresh failed');fetchStatus();};
 
-savePullBtn.onclick = async function(){
-  var url = pullUrlEl.value.trim();
-  if(!url){ alert('Enter a URL'); return; }
-  var res = await fetch('/pullurl', {
-    method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:'url='+encodeURIComponent(url)
-  });
-  if(res.ok) alert('Saved'); else alert('Failed to save');
-  await fetchStatus();
-};
+const EPD_W=800,EPD_H=480,EPD_BYTES=EPD_W*EPD_H/2; const pal=[{code:0x0,r:0,g:0,b:0},{code:0x1,r:255,g:255,b:255},{code:0x2,r:255,g:255,b:0},{code:0x3,r:255,g:0,b:0},{code:0x5,r:0,g:0,b:255},{code:0x6,r:0,g:128,b:0},{code:0x7,r:255,g:255,b:255}];
+const nearest=(r,g,b)=>pal.reduce((a,p)=>{const d=(r-p.r)**2+(g-p.g)**2+(b-p.b)**2;return d<a.d?{d,p}:a},{d:1e12,p:pal[0]}).p;
+function fsDither(img){const d=img.data,w=img.width,h=img.height,cl=v=>Math.max(0,Math.min(255,v));for(let y=0;y<h;y++){for(let x=0;x<w;x++){let i=(y*w+x)*4,or=d[i],og=d[i+1],ob=d[i+2],n=nearest(or,og,ob);d[i]=n.r;d[i+1]=n.g;d[i+2]=n.b;let er=or-n.r,eg=og-n.g,eb=ob-n.b;const sc=(nx,ny,f)=>{if(nx<0||ny<0||nx>=w||ny>=h)return;let j=(ny*w+nx)*4;d[j]=cl(d[j]+er*f);d[j+1]=cl(d[j+1]+eg*f);d[j+2]=cl(d[j+2]+eb*f)};sc(x+1,y,7/16);sc(x-1,y+1,3/16);sc(x,y+1,5/16);sc(x+1,y+1,1/16);}}}
+function convertImage(file,onProg){return new Promise((resolve,reject)=>{const fr=new FileReader();fr.onerror=()=>reject('read');fr.onload=()=>{const im=new Image();im.onload=()=>{onProg(20);const c=document.createElement('canvas');c.width=EPD_W;c.height=EPD_H;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,EPD_W,EPD_H);const portrait=im.height>im.width;if(portrait){x.save();x.translate(EPD_W/2,EPD_H/2);x.rotate(-Math.PI/2);const w=EPD_H,h=EPD_W,s=Math.max(w/im.width,h/im.height);x.drawImage(im,-im.width*s/2,-im.height*s/2,im.width*s,im.height*s);x.restore();}else{const s=Math.max(EPD_W/im.width,EPD_H/im.height);x.drawImage(im,(EPD_W-im.width*s)/2,(EPD_H-im.height*s)/2,im.width*s,im.height*s);}onProg(60);const id=x.getImageData(0,0,EPD_W,EPD_H);fsDither(id);onProg(85);const out=new Uint8Array(EPD_BYTES);let p=0;for(let i=0;i<id.data.length;i+=8){out[p++]=(nearest(id.data[i],id.data[i+1],id.data[i+2]).code<<4)|nearest(id.data[i+4],id.data[i+5],id.data[i+6]).code;}onProg(100);resolve(out);};im.onerror=()=>reject('image');im.src=fr.result;};fr.readAsDataURL(file);});}
+function setProgress(label,pct){$('progressLabel').textContent=label;$('progressBar').style.width=pct+'%';}
 
-saveSleepBtn.onclick = async function(){
-  var hours = parseInt(sleepHoursEl.value);
-  if(isNaN(hours) || hours < 1 || hours > 168){
-    alert('Hours must be between 1 and 168');
-    return;
-  }
-  if(oshaEnabledEl.checked && hours > 24){
-    alert('When OSHA mode is enabled, interval must be 24 hours or less');
-    return;
-  }
-  var res = await fetch('/sleepconfig', {
-    method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:'hours='+hours
-  });
-  if(res.ok) alert('Saved - will wake every '+hours+' hours'); else alert('Failed to save');
-  await fetchStatus();
-};
+async function uploadLibrary(){const f=$('fileInput').files[0];if(!f) return alert('Pick an image');const base=$('imageName').value.trim()||f.name.replace(/\.[^.]+$/,'');
+  try{setProgress('Converting…',0);const packed=await convertImage(f,p=>setProgress('Converting…',p));
+    setProgress('Uploading…',0);await new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','/images/upload?name='+encodeURIComponent(base));x.upload.onprogress=e=>{if(e.lengthComputable)setProgress('Uploading…',Math.round((e.loaded/e.total)*100));};x.onload=()=>x.status===200?resolve():reject();x.onerror=reject;x.send(new Blob([packed],{type:'application/octet-stream'}));});
+    setProgress('Done',100);setStatus('Upload complete');await refreshLibrary();
+  }catch(e){setStatus('Upload failed');setProgress('Failed',0);} }
+$('uploadBtn').onclick=uploadLibrary;
 
-// Palette for EPD
-var palette=[
-  {code:0x0,r:0,g:0,b:0},
-  {code:0x1,r:255,g:255,b:255},
-  {code:0x2,r:255,g:255,b:0},
-  {code:0x3,r:255,g:0,b:0},
-  {code:0x5,r:0,g:0,b:255},
-  {code:0x6,r:0,g:128,b:0},
-  {code:0x7,r:255,g:255,b:255}
-];
-var paletteByCode={};
-palette.forEach(function(p){ paletteByCode[p.code]=p; });
-
-function nearestPaletteColor(r,g,b){
-  var best=palette[0], bestDist=Infinity;
-  for(var i=0;i<palette.length;i++){
-    var p=palette[i];
-    var dr=r-p.r,dg=g-p.g,db=b-p.b;
-    var dist=dr*dr+dg*dg+db*db;
-    if(dist<bestDist){bestDist=dist;best=p;}
-  }
-  return best;
-}
-function clamp(v){ return Math.max(0,Math.min(255,v)); }
-
-function applyFloydSteinberg(imgData){
-  var data=imgData.data, width=imgData.width, height=imgData.height;
-  for(var y=0;y<height;y++){
-    for(var x=0;x<width;x++){
-      var idx=(y*width+x)*4;
-      var oldR=data[idx], oldG=data[idx+1], oldB=data[idx+2];
-      var n=nearestPaletteColor(oldR,oldG,oldB);
-      data[idx]=n.r; data[idx+1]=n.g; data[idx+2]=n.b;
-      var errR=oldR-n.r, errG=oldG-n.g, errB=oldB-n.b;
-      function scatter(nx,ny,f){
-        if(nx<0||nx>=width||ny<0||ny>=height) return;
-        var j=(ny*width+nx)*4;
-        data[j]=clamp(data[j]+errR*f);
-        data[j+1]=clamp(data[j+1]+errG*f);
-        data[j+2]=clamp(data[j+2]+errB*f);
-      }
-      scatter(x+1,y,7/16);
-      scatter(x-1,y+1,3/16);
-      scatter(x,y+1,5/16);
-      scatter(x+1,y+1,1/16);
-    }
-  }
+async function refreshLibrary(){const res=await fetch('/images/list');const arr=res.ok?await res.json():[];const root=$('library');root.innerHTML='';
+  arr.forEach(name=>{const row=document.createElement('div');row.className='item';const title=document.createElement('div');title.textContent=name;
+    const actions=document.createElement('div');const show=document.createElement('button');show.textContent='Send to display';show.onclick=async()=>{await fetch('/display/show',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)});fetchStatus();};
+    const del=document.createElement('button');del.style.background='#dc2626';del.textContent='Delete';del.onclick=async()=>{if(confirm('Delete '+name+'?')){await fetch('/images/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)});refreshLibrary();}};
+    actions.append(show,del);row.append(title,actions);root.appendChild(row);});
 }
 
-function packToEPD(imgData){
-  var packed=new Uint8Array(800*480/2);
-  var p=0;
-  for(var i=0;i<imgData.data.length;i+=8){
-    var n1=nearestPaletteColor(imgData.data[i],imgData.data[i+1],imgData.data[i+2]).code;
-    var n2=nearestPaletteColor(imgData.data[i+4],imgData.data[i+5],imgData.data[i+6]).code;
-    packed[p++]=(n1<<4)|n2;
-  }
-  return packed;
-}
-
-function cropAndDraw(image, applyDither){
-  var cw=800,ch=480;
-  var canvas=document.createElement('canvas');
-  canvas.width=cw; canvas.height=ch;
-  var ctx=canvas.getContext('2d');
-  ctx.imageSmoothingEnabled=true;
-  ctx.fillStyle='#ffffff';
-  ctx.fillRect(0,0,cw,ch);
-  var portrait=image.height>image.width;
-  if(portrait){
-    ctx.save();
-    ctx.translate(cw/2,ch/2);
-    ctx.rotate(-Math.PI/2);
-    var w=ch, h=cw;
-    var scale=Math.max(w/image.width, h/image.height);
-    var dw=image.width*scale;
-    var dh=image.height*scale;
-    ctx.drawImage(image, -dw/2, -dh/2, dw, dh);
-    ctx.restore();
-  }else{
-    var scale2=Math.max(cw/image.width, ch/image.height);
-    var dw2=image.width*scale2;
-    var dh2=image.height*scale2;
-    var dx=(cw-dw2)/2;
-    var dy=(ch-dh2)/2;
-    ctx.drawImage(image, dx, dy, dw2, dh2);
-  }
-  var imgData=ctx.getImageData(0,0,cw,ch);
-  if(applyDither) applyFloydSteinberg(imgData);
-  return packToEPD(imgData);
-}
-
-function formatSize(bytes){
-  if(bytes < 1024) return bytes+' B';
-  if(bytes < 1024*1024) return (bytes/1024).toFixed(1)+' KB';
-  return (bytes/(1024*1024)).toFixed(1)+' MB';
-}
-
-async function refreshSdList(){
-  var path = sdPathEl.value.trim() || '/';
-  var res = await fetch('/sd/list?path='+encodeURIComponent(path));
-  if(!res.ok){ logStatus('Failed to read SD path'); return; }
-  var data = await res.json();
-  sdPathEl.value = data.path || path;
-  sdListEl.innerHTML = '';
-  (data.entries || []).forEach(function(entry){
-    var row = document.createElement('div');
-    row.className = 'file-row';
-
-    var left = document.createElement('div');
-    var label = document.createElement('div');
-    label.textContent = (entry.is_dir ? '📁 ' : '📄 ') + entry.name;
-    var meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = entry.path + (entry.is_dir ? '' : (' • ' + formatSize(entry.size || 0)));
-    left.appendChild(label);
-    left.appendChild(meta);
-
-    var actions = document.createElement('div');
-    if(entry.is_dir){
-      var openBtn = document.createElement('button');
-      openBtn.textContent = 'Open';
-      openBtn.onclick = function(){ sdPathEl.value = entry.path; refreshSdList(); };
-      actions.appendChild(openBtn);
-    }
-    var delBtn = document.createElement('button');
-    delBtn.style.background = '#dc2626';
-    delBtn.textContent = 'Delete';
-    delBtn.onclick = async function(){
-      if(!confirm('Delete '+entry.path+'?')) return;
-      await fetch('/sd/delete', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'path='+encodeURIComponent(entry.path) });
-      await refreshSdList();
-    };
-    actions.appendChild(delBtn);
-
-    row.appendChild(left);
-    row.appendChild(actions);
-    sdListEl.appendChild(row);
-  });
-}
-
-sdRefreshBtn.onclick = refreshSdList;
-
-sdUploadBtn.onclick = async function(){
-  var file = sdUploadFileEl.files[0];
-  if(!file){ alert('Pick a file to upload'); return; }
-  var path = sdPathEl.value.trim() || '/';
-  var fd = new FormData();
-  fd.append('file', file, file.name);
-  var res = await fetch('/sd/upload?path='+encodeURIComponent(path), { method:'POST', body:fd });
-  if(res.ok){ logStatus('File uploaded'); refreshSdList(); }
-  else logStatus('Upload failed');
-};
-
-sdMkdirBtn.onclick = async function(){
-  var folder = sdMkdirNameEl.value.trim();
-  if(!folder){ alert('Enter folder name'); return; }
-  var base = sdPathEl.value.trim() || '/';
-  if(!base.endsWith('/')) base += '/';
-  var path = base + folder;
-  var res = await fetch('/sd/mkdir', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'path='+encodeURIComponent(path) });
-  if(res.ok){ sdMkdirNameEl.value=''; refreshSdList(); }
-  else logStatus('Create folder failed');
-};
-
-// Initial fetches
-fetchStatus();
-fetchSession();
-refreshSdList();
-schedulePolling();
+fetchStatus();fetchSession();refreshLibrary();
 </script>
-</div>
-</body>
-</html>
+</div></body></html>
