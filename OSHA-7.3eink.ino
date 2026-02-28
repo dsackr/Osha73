@@ -168,8 +168,10 @@ uint32_t sleepHours = 24;  // Default: wake once per day
 volatile bool displayBusy = false;
 static bool uploadInProgress = false;
 static size_t imageBytesWritten = 0;
+static size_t imageExpectedTotal = 0;
 static bool displayUploadFailed = false;
 static String displayUploadError = "";
+static bool displayUploadEnded = false;
 
 static bool galleryUploadInProgress = false;
 static bool galleryUploadFailed = false;
@@ -229,7 +231,7 @@ bool shouldOverwriteLowBattery();
 uint8_t applyLowBatteryOverlayNibble(int x, int y, uint8_t nibble);
 
 String sanitizeFileName(const String &name);
-void maybeOpenSDForSave();
+void maybeOpenSDForSave(const String &requestedName);
 void shutdownForever();
 void writeDisplayRefreshSequence();
 void setOshaModeEnabled(bool enabled);
@@ -780,11 +782,9 @@ bool configureSdCardDefaults(String &errorOut) {
   return !sdSetupRequired;
 }
 
-void maybeOpenSDForSave() {
+void maybeOpenSDForSave(const String &requestedName) {
   if (!sdMounted) return;
-  if (!server.hasArg("save")) return;
-
-  String requested = sanitizeFileName(server.arg("save"));
+  String requested = sanitizeFileName(requestedName);
   if (requested.length() == 0) return;
 
   if (currentImageFile) currentImageFile.close();
@@ -1154,8 +1154,18 @@ void handleUploadStream() {
     displayUploadFailed = false;
     displayUploadError = "";
     imageBytesWritten = 0;
+    imageExpectedTotal = up.totalSize;
+    displayUploadEnded = false;
 
-    maybeOpenSDForSave();
+    String requestedName = server.arg("name");
+    if (requestedName.length() == 0) requestedName = up.filename;
+    maybeOpenSDForSave(requestedName);
+
+    if (imageExpectedTotal > 0) {
+      Serial.printf("WEB: display upload start total=%u\n", (unsigned int)imageExpectedTotal);
+    } else {
+      Serial.println("WEB: display upload start total=unknown");
+    }
 
     EPD_Init();
     Epaper_Write_Command(DTM);
@@ -1183,12 +1193,25 @@ void handleUploadStream() {
       if (currentImageFile) currentImageFile.write(byteOut);
       imageBytesWritten++;
     }
+  } else if (up.status == UPLOAD_FILE_END) {
+    displayUploadEnded = true;
+    uploadInProgress = false;
+    if (currentImageFile) {
+      currentImageFile.flush();
+      currentImageFile.close();
+    }
+    if (imageExpectedTotal > 0 && imageExpectedTotal != imageBytesWritten) {
+      displayUploadFailed = true;
+      displayUploadError = "size mismatch";
+    }
+    Serial.printf("WEB: display upload end bytes=%u\n", (unsigned int)imageBytesWritten);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Serial.println("WEB: display upload aborted");
     appendDeviceLog("Display upload aborted");
     displayUploadFailed = true;
     displayUploadError = "upload aborted";
     uploadInProgress = false;
+    displayUploadEnded = false;
     displayBusy = false;
     if (currentImageFile) currentImageFile.close();
   }
@@ -1205,23 +1228,18 @@ void handleUploadDone() {
     server.send(409, "application/json", json);
     return;
   }
-  if (!uploadInProgress) { server.send(500, "application/json", "{\"error\":\"no upload\"}"); return; }
+  if (!displayUploadEnded && !uploadInProgress) { server.send(500, "application/json", "{\"error\":\"no upload\"}"); return; }
 
   while (imageBytesWritten < EPD_BUFFER_SIZE) {
     Epaper_Write_Data(0x11);
-    if (currentImageFile) currentImageFile.write(0x11);
     imageBytesWritten++;
-  }
-
-  if (currentImageFile) {
-    currentImageFile.flush();
-    currentImageFile.close();
   }
 
   setOshaModeEnabled(false);
   appendDeviceLog("Manual override image uploaded and displayed");
   Serial.println("WEB: Display upload complete; picture mode enabled and refresh queued");
   uploadInProgress = false;
+  displayUploadEnded = false;
   pendingDisplayRefresh = true;
 
   server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Upload complete, refreshing\"}");
@@ -1739,7 +1757,8 @@ void handleRawImagesUpload() {
       return;
     }
 
-    String requestedName = server.hasArg("name") ? server.arg("name") : up.filename;
+    String requestedName = server.arg("name");
+    if (requestedName.length() == 0) requestedName = up.filename;
     galleryUploadName = sanitizeGalleryFileName(requestedName);
     galleryUploadPath = "/gallery/" + galleryUploadName;
 
@@ -1768,13 +1787,6 @@ void handleRawImagesUpload() {
       galleryUploadError = "write failed";
       return;
     }
-
-    if (galleryExpectedTotal > 0) {
-      int pct = (int)((galleryBytesReceived * 100UL) / galleryExpectedTotal);
-      Serial.printf("WEB: gallery upload progress %u/%u (%d%%)\n", (unsigned int)galleryBytesReceived, (unsigned int)galleryExpectedTotal, pct);
-    } else {
-      Serial.printf("WEB: gallery upload progress %u bytes\n", (unsigned int)galleryBytesReceived);
-    }
   } else if (up.status == UPLOAD_FILE_END) {
     if (!galleryUploadInProgress) return;
 
@@ -1787,6 +1799,7 @@ void handleRawImagesUpload() {
       galleryUploadError = "invalid size";
       SD.remove(galleryUploadPath.c_str());
     }
+    Serial.printf("WEB: gallery upload end file=%s bytes=%u\n", galleryUploadName.c_str(), (unsigned int)galleryBytesReceived);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Serial.println("WEB: gallery upload aborted");
     galleryUploadFailed = true;
