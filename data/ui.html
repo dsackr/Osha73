@@ -89,7 +89,7 @@ function normalizeUploadName(raw){return (raw||'').replace(/[^A-Za-z0-9_-]/g,'')
 
 async function uploadLibrary(){const f=$('fileInput').files[0];if(!f) return alert('Pick an image');const requested=$('imageName').value.trim()||f.name.replace(/\.[^.]+$/,'');const targetName=normalizeUploadName(requested);
   try{setProgress('Converting…',0);const packed=await convertImage(f,p=>setProgress('Converting…',p));
-    setProgress('Uploading…',0);await new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','/images/upload'+(targetName?('?name='+encodeURIComponent(targetName)):''));x.upload.onprogress=e=>{if(e.lengthComputable)setProgress('Uploading…',Math.round((e.loaded/e.total)*100));};x.onload=()=>x.status===200?resolve():reject();x.onerror=reject;x.send(new Blob([packed],{type:'application/octet-stream'}));});
+    setProgress('Uploading…',0);await new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','/images/upload'+(targetName?('?name='+encodeURIComponent(targetName)):''));x.upload.onprogress=e=>{if(e.lengthComputable)setProgress('Uploading…',Math.round((e.loaded/e.total)*100));};x.onload=()=>x.status===200?resolve():reject();x.onerror=reject;const form=new FormData();const uploadName=(targetName||'upload')+'.bin';form.append('file',new Blob([packed],{type:'application/octet-stream'}),uploadName);x.send(form);});
     setProgress('Done',100);setStatus('Upload complete');await refreshLibrary();
   }catch(e){setStatus('Upload failed');setProgress('Failed',0);} }
 $('uploadBtn').onclick=uploadLibrary;

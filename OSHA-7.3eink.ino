@@ -180,6 +180,7 @@ static String galleryUploadName = "";
 static String galleryUploadPath = "";
 static size_t galleryBytesReceived = 0;
 static size_t galleryExpectedTotal = 0;
+static size_t galleryBytesWritten = 0;
 
 File currentImageFile;
 File galleryUploadFile;
@@ -200,6 +201,7 @@ String sanitizeGalleryFileName(const String &name);
 void handleRawImagesUpload();
 void handleRawImagesUploadDone();
 void handleImagesList();
+void handleImagesInspect();
 void handleImagesDelete();
 void handleDisplayShow();
 void handleOshaRefresh();
@@ -1748,6 +1750,7 @@ void handleRawImagesUpload() {
     galleryUploadFailed = false;
     galleryUploadError = "";
     galleryBytesReceived = 0;
+    galleryBytesWritten = 0;
     galleryExpectedTotal = up.totalSize;
     if (galleryUploadFile) galleryUploadFile.close();
 
@@ -1782,6 +1785,7 @@ void handleRawImagesUpload() {
 
     size_t wrote = galleryUploadFile.write(up.buf, up.currentSize);
     galleryBytesReceived += up.currentSize;
+    galleryBytesWritten += wrote;
     if (wrote != up.currentSize) {
       galleryUploadFailed = true;
       galleryUploadError = "write failed";
@@ -1790,16 +1794,22 @@ void handleRawImagesUpload() {
   } else if (up.status == UPLOAD_FILE_END) {
     if (!galleryUploadInProgress) return;
 
+    size_t finalSize = galleryUploadFile.size();
     galleryUploadFile.flush();
     galleryUploadFile.close();
     galleryUploadInProgress = false;
 
-    if (galleryBytesReceived != EPD_BUFFER_SIZE) {
+    Serial.printf("WEB: gallery upload end file=%s bytesReceived=%u bytesWritten=%u fileSize=%u\n",
+                  galleryUploadName.c_str(),
+                  (unsigned int)galleryBytesReceived,
+                  (unsigned int)galleryBytesWritten,
+                  (unsigned int)finalSize);
+
+    if (finalSize != EPD_BUFFER_SIZE || galleryBytesReceived != EPD_BUFFER_SIZE || galleryBytesWritten != EPD_BUFFER_SIZE) {
       galleryUploadFailed = true;
       galleryUploadError = "invalid size";
       SD.remove(galleryUploadPath.c_str());
     }
-    Serial.printf("WEB: gallery upload end file=%s bytes=%u\n", galleryUploadName.c_str(), (unsigned int)galleryBytesReceived);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Serial.println("WEB: gallery upload aborted");
     galleryUploadFailed = true;
@@ -1826,7 +1836,7 @@ void handleRawImagesUploadDone() {
     return;
   }
 
-  if (galleryBytesReceived != EPD_BUFFER_SIZE) {
+  if (galleryBytesReceived != EPD_BUFFER_SIZE || galleryBytesWritten != EPD_BUFFER_SIZE) {
     if (galleryUploadPath.length() > 0 && SD.exists(galleryUploadPath.c_str())) SD.remove(galleryUploadPath.c_str());
     server.send(400, "application/json", "{\"error\":\"invalid size\"}");
     return;
@@ -1853,6 +1863,32 @@ void handleImagesList() {
   server.send(200, "application/json", out);
 }
 
+void handleImagesInspect() {
+  logWebRequest("handleImagesInspect");
+  if (!sdMounted || !server.hasArg("name")) { server.send(400, "application/json", "{\"error\":\"missing name\"}"); return; }
+
+  String name = sanitizeGalleryFileName(server.arg("name"));
+  String path = "/gallery/" + name;
+  File f = SD.open(path.c_str(), FILE_READ);
+  if (!f) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+
+  size_t fileSize = f.size();
+  uint8_t first[16] = {0};
+  size_t got = f.read(first, sizeof(first));
+  f.close();
+
+  String firstHex = "";
+  for (size_t i = 0; i < got; i++) {
+    char byteHex[3];
+    snprintf(byteHex, sizeof(byteHex), "%02X", first[i]);
+    firstHex += byteHex;
+    if (i + 1 < got) firstHex += " ";
+  }
+
+  String out = String("{\"name\":\"") + name + "\",\"size\":" + String((unsigned int)fileSize) + ",\"first16\":\"" + firstHex + "\"}";
+  server.send(200, "application/json", out);
+}
+
 void handleImagesDelete() {
   logWebRequest("handleImagesDelete");
   if (!sdMounted || !server.hasArg("name")) { server.send(400, "application/json", "{\"error\":\"missing name\"}"); return; }
@@ -1869,22 +1905,55 @@ void handleDisplayShow() {
   File f = SD.open(("/gallery/" + name).c_str(), FILE_READ);
   if (!f) { server.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
 
+  size_t fileSize = f.size();
+  if (fileSize != EPD_BUFFER_SIZE) {
+    f.close();
+    Serial.printf("WEB: display show rejected file=%s size=%u expected=%u\n", name.c_str(), (unsigned int)fileSize, (unsigned int)EPD_BUFFER_SIZE);
+    server.send(400, "application/json", "{\"error\":\"invalid size\"}");
+    return;
+  }
+  if (!f.seek(0)) {
+    f.close();
+    server.send(500, "application/json", "{\"error\":\"seek failed\"}");
+    return;
+  }
+
   displayBusy = true;
   EPD_Init();
   Epaper_Write_Command(DTM);
-  size_t written = 0;
-  while (written < EPD_BUFFER_SIZE) {
-    int b = f.read();
-    if (b < 0) b = 0x11;
-    int y = written / BYTES_PER_ROW;
-    int xb = written % BYTES_PER_ROW;
-    int x1 = xb * 2, x2 = x1 + 1;
-    uint8_t hi = applyLowBatteryOverlayNibble(x1, y, (b >> 4) & 0x0F);
-    uint8_t lo = applyLowBatteryOverlayNibble(x2, y, b & 0x0F);
-    Epaper_Write_Data((hi << 4) | lo);
-    written++;
+
+  uint8_t rowBuffer[BYTES_PER_ROW];
+  size_t bytesRead = 0;
+  bool readFailed = false;
+  while (bytesRead < EPD_BUFFER_SIZE) {
+    size_t rowRead = f.read(rowBuffer, sizeof(rowBuffer));
+    if (rowRead != sizeof(rowBuffer)) {
+      readFailed = true;
+      break;
+    }
+
+    int y = bytesRead / BYTES_PER_ROW;
+    for (size_t xb = 0; xb < rowRead; xb++) {
+      uint8_t b = rowBuffer[xb];
+      int x1 = (int)xb * 2;
+      int x2 = x1 + 1;
+      uint8_t hi = applyLowBatteryOverlayNibble(x1, y, (b >> 4) & 0x0F);
+      uint8_t lo = applyLowBatteryOverlayNibble(x2, y, b & 0x0F);
+      Epaper_Write_Data((hi << 4) | lo);
+    }
+    bytesRead += rowRead;
   }
+
   f.close();
+  Serial.printf("WEB: display show file=%s bytesRead=%u\n", name.c_str(), (unsigned int)bytesRead);
+
+  if (readFailed || bytesRead != EPD_BUFFER_SIZE) {
+    EPD_DeepSleep();
+    displayBusy = false;
+    server.send(500, "application/json", "{\"error\":\"read failed\"}");
+    return;
+  }
+
   Epaper_Write_Command(DRF);
   Epaper_Write_Data(0x00);
   Epaper_READBUSY();
@@ -1923,6 +1992,7 @@ void setupWebServer() {
   server.on("/shutdown", HTTP_GET, handleShutdown);
   server.on("/images/upload", HTTP_POST, handleRawImagesUploadDone, handleRawImagesUpload);
   server.on("/images/list", HTTP_GET, handleImagesList);
+  server.on("/images/inspect", HTTP_GET, handleImagesInspect);
   server.on("/images/delete", HTTP_POST, handleImagesDelete);
   server.on("/display/show", HTTP_POST, handleDisplayShow);
   server.on("/osha/config", HTTP_POST, handleOshaConfig);
