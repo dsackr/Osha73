@@ -1327,7 +1327,20 @@ bool loadOshaLayout(OshaLayout &layout) {
   File f = SD.open("/osha/config.json", FILE_READ);
   if (!f) return false;
   DynamicJsonDocument d(2048);
-  if (deserializeJson(d, f)) { f.close(); return false; }
+  if (deserializeJson(d, f)) {
+    f.close();
+    appendDeviceLog("OSHA layout warning: failed to parse /osha/config.json, using defaults");
+    layout.backgroundPath = "/osha/background.bin";
+    layout.daysX = 70; layout.daysY = 120; layout.daysScale = 10;
+    layout.priorX = 520; layout.priorY = 120; layout.priorScale = 4;
+    layout.incidentX = 520; layout.incidentY = 190; layout.incidentScale = 4;
+    layout.dateX = 520; layout.dateY = 250; layout.dateScale = 3;
+    layout.deployBoxX = 520; layout.deployBoxY = 320;
+    layout.changeBoxX = 520; layout.changeBoxY = 360;
+    layout.missedBoxX = 520; layout.missedBoxY = 400;
+    layout.boxSize = 18;
+    return true;
+  }
   f.close();
   layout.backgroundPath = d["background_path"] | "/osha/background.bin";
   layout.daysX = d["days_x"] | 70; layout.daysY = d["days_y"] | 120; layout.daysScale = d["days_scale"] | 10;
@@ -1346,25 +1359,41 @@ String nyTodayDate() {
   struct tm tmny;
   localtime_r(&now, &tmny);
   char buf[11];
-  strftime(buf, sizeof(buf), "%Y-%m-%d", &tmny);
+  strftime(buf, sizeof(buf), "%m/%d/%Y", &tmny);
   return String(buf);
 }
 
 int daysBetweenDates(const String &fromDate, const String &toDate) {
-  if (fromDate.length() < 10 || toDate.length() < 10) return 0;
+  if (fromDate.length() < 10 || toDate.length() < 10) return -1;
   struct tm a = {};
-  a.tm_year = fromDate.substring(0,4).toInt() - 1900;
-  a.tm_mon = fromDate.substring(5,7).toInt() - 1;
-  a.tm_mday = fromDate.substring(8,10).toInt();
+  int fromMonth = 0;
+  int fromDay = 0;
+  int fromYear = 0;
+  if (sscanf(fromDate.c_str(), "%d/%d/%d", &fromMonth, &fromDay, &fromYear) != 3) {
+    Serial.printf("OSHA date parse failed for fromDate: %s\n", fromDate.c_str());
+    return -1;
+  }
+  a.tm_mon = fromMonth - 1;
+  a.tm_mday = fromDay;
+  a.tm_year = fromYear - 1900;
   a.tm_hour = 12;
+
   struct tm b = {};
-  b.tm_year = toDate.substring(0,4).toInt() - 1900;
-  b.tm_mon = toDate.substring(5,7).toInt() - 1;
-  b.tm_mday = toDate.substring(8,10).toInt();
+  int toMonth = 0;
+  int toDay = 0;
+  int toYear = 0;
+  if (sscanf(toDate.c_str(), "%d/%d/%d", &toMonth, &toDay, &toYear) != 3) {
+    Serial.printf("OSHA date parse failed for toDate: %s\n", toDate.c_str());
+    return -1;
+  }
+  b.tm_mon = toMonth - 1;
+  b.tm_mday = toDay;
+  b.tm_year = toYear - 1900;
   b.tm_hour = 12;
+
   time_t ta = mktime(&a);
   time_t tb = mktime(&b);
-  if (ta <= 0 || tb <= 0) return 0;
+  if (ta <= 0 || tb <= 0) return -1;
   return max(0, (int)((tb - ta) / 86400));
 }
 
@@ -1537,6 +1566,7 @@ bool fetchOshaState(OshaState &stateOut) {
   String latestDate = "";
   String latestReason = "";
   String latestIncidentId = "";
+  int latestPackedDate = -1;
   int pos = 0;
   bool header = true;
 
@@ -1567,19 +1597,22 @@ bool fetchOshaState(OshaState &stateOut) {
     int year = date.substring(s2 + 1).toInt();
     if (year < 2000 || month < 1 || month > 12 || day < 1 || day > 31) continue;
 
-    char isoBuf[11];
-    snprintf(isoBuf, sizeof(isoBuf), "%04d-%02d-%02d", year, month, day);
-    String isoDate = String(isoBuf);
+    char dateBuf[11];
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d", month, day, year);
+    String normalizedDate = String(dateBuf);
 
     bool seen = false;
     for (const String &d : uniqueDates) {
-      if (d == isoDate) { seen = true; break; }
+      if (d == normalizedDate) { seen = true; break; }
     }
     if (seen) continue;
 
-    uniqueDates.push_back(isoDate);
-    if (latestDate.length() == 0 || isoDate > latestDate) {
-      latestDate = isoDate;
+    uniqueDates.push_back(normalizedDate);
+
+    int packedDate = year * 10000 + month * 100 + day;
+    if (latestPackedDate < 0 || packedDate > latestPackedDate) {
+      latestPackedDate = packedDate;
+      latestDate = normalizedDate;
       latestReason = normalizeOshaCategory(reason);
       latestIncidentId = incident;
     }
@@ -1592,7 +1625,7 @@ bool fetchOshaState(OshaState &stateOut) {
     for (size_t i = 0; i < latestIncidentId.length(); i++) {
       if (isdigit((unsigned char)latestIncidentId[i])) digits += latestIncidentId[i];
     }
-    stateOut.days = daysBetweenDates(latestDate, nyTodayDate());
+    stateOut.days = max(0, daysBetweenDates(latestDate, nyTodayDate()));
     stateOut.prior = max(0, (int)uniqueDates.size() - 1);
     stateOut.incident = digits;
     stateOut.date = latestDate;
@@ -1644,41 +1677,58 @@ bool renderOshaDisplay(const OshaState &state) {
   Epaper_Write_Command(DTM);
 
   size_t written = 0;
+  uint8_t rowBuffer[BYTES_PER_ROW];
   while (written < EPD_BUFFER_SIZE) {
-    int b = bg.read();
-    if (b < 0) b = 0x11;
+    size_t rowRead = bg.read(rowBuffer, sizeof(rowBuffer));
+    if (rowRead != sizeof(rowBuffer)) {
+      Serial.printf("OSHA render failed: SD read error at offset %u (got %u, expected %u)\n",
+                    (unsigned int)written,
+                    (unsigned int)rowRead,
+                    (unsigned int)sizeof(rowBuffer));
+      appendDeviceLog("OSHA render failed: SD read error at offset %u", (unsigned int)written);
+      bg.close();
+      EPD_DeepSleep();
+      return false;
+    }
+
     int y = written / BYTES_PER_ROW;
-    int xb = written % BYTES_PER_ROW;
-    int x1 = xb * 2, x2 = x1 + 1;
-
-    uint8_t hi = (b >> 4) & 0x0F;
-    uint8_t lo = b & 0x0F;
-
     String daysTxt = String(state.days);
-    if (textPixel(x1,y,layout.daysX,layout.daysY,daysTxt,layout.daysScale)) hi = EPD_7IN3F_BLACK;
-    if (textPixel(x2,y,layout.daysX,layout.daysY,daysTxt,layout.daysScale)) lo = EPD_7IN3F_BLACK;
-    if (textPixel(x1,y,layout.priorX,layout.priorY,String(state.prior),layout.priorScale)) hi = EPD_7IN3F_BLACK;
-    if (textPixel(x2,y,layout.priorX,layout.priorY,String(state.prior),layout.priorScale)) lo = EPD_7IN3F_BLACK;
-    if (textPixel(x1,y,layout.incidentX,layout.incidentY,state.incident,layout.incidentScale)) hi = EPD_7IN3F_BLACK;
-    if (textPixel(x2,y,layout.incidentX,layout.incidentY,state.incident,layout.incidentScale)) lo = EPD_7IN3F_BLACK;
-    if (textPixel(x1,y,layout.dateX,layout.dateY,state.date,layout.dateScale)) hi = EPD_7IN3F_BLACK;
-    if (textPixel(x2,y,layout.dateX,layout.dateY,state.date,layout.dateScale)) lo = EPD_7IN3F_BLACK;
-
+    String priorTxt = String(state.prior);
     bool dep = state.reason == "Deploy";
     bool chg = state.reason == "Change";
     bool mis = state.reason == "Missed Task";
-    if (boxPixel(x1,y,layout.deployBoxX,layout.deployBoxY,dep)) hi = EPD_7IN3F_BLACK;
-    if (boxPixel(x2,y,layout.deployBoxX,layout.deployBoxY,dep)) lo = EPD_7IN3F_BLACK;
-    if (boxPixel(x1,y,layout.changeBoxX,layout.changeBoxY,chg)) hi = EPD_7IN3F_BLACK;
-    if (boxPixel(x2,y,layout.changeBoxX,layout.changeBoxY,chg)) lo = EPD_7IN3F_BLACK;
-    if (boxPixel(x1,y,layout.missedBoxX,layout.missedBoxY,mis)) hi = EPD_7IN3F_BLACK;
-    if (boxPixel(x2,y,layout.missedBoxX,layout.missedBoxY,mis)) lo = EPD_7IN3F_BLACK;
 
-    hi = applyLowBatteryOverlayNibble(x1,y,hi);
-    lo = applyLowBatteryOverlayNibble(x2,y,lo);
+    for (size_t xb = 0; xb < rowRead; xb++) {
+      uint8_t b = rowBuffer[xb];
+      int x1 = (int)xb * 2;
+      int x2 = x1 + 1;
 
-    Epaper_Write_Data((hi << 4) | lo);
-    written++;
+      uint8_t hi = (b >> 4) & 0x0F;
+      uint8_t lo = b & 0x0F;
+
+      if (textPixel(x1, y, layout.daysX, layout.daysY, daysTxt, layout.daysScale)) hi = EPD_7IN3F_BLACK;
+      if (textPixel(x2, y, layout.daysX, layout.daysY, daysTxt, layout.daysScale)) lo = EPD_7IN3F_BLACK;
+      if (textPixel(x1, y, layout.priorX, layout.priorY, priorTxt, layout.priorScale)) hi = EPD_7IN3F_BLACK;
+      if (textPixel(x2, y, layout.priorX, layout.priorY, priorTxt, layout.priorScale)) lo = EPD_7IN3F_BLACK;
+      if (textPixel(x1, y, layout.incidentX, layout.incidentY, state.incident, layout.incidentScale)) hi = EPD_7IN3F_BLACK;
+      if (textPixel(x2, y, layout.incidentX, layout.incidentY, state.incident, layout.incidentScale)) lo = EPD_7IN3F_BLACK;
+      if (textPixel(x1, y, layout.dateX, layout.dateY, state.date, layout.dateScale)) hi = EPD_7IN3F_BLACK;
+      if (textPixel(x2, y, layout.dateX, layout.dateY, state.date, layout.dateScale)) lo = EPD_7IN3F_BLACK;
+
+      if (boxPixel(x1, y, layout.deployBoxX, layout.deployBoxY, dep)) hi = EPD_7IN3F_BLACK;
+      if (boxPixel(x2, y, layout.deployBoxX, layout.deployBoxY, dep)) lo = EPD_7IN3F_BLACK;
+      if (boxPixel(x1, y, layout.changeBoxX, layout.changeBoxY, chg)) hi = EPD_7IN3F_BLACK;
+      if (boxPixel(x2, y, layout.changeBoxX, layout.changeBoxY, chg)) lo = EPD_7IN3F_BLACK;
+      if (boxPixel(x1, y, layout.missedBoxX, layout.missedBoxY, mis)) hi = EPD_7IN3F_BLACK;
+      if (boxPixel(x2, y, layout.missedBoxX, layout.missedBoxY, mis)) lo = EPD_7IN3F_BLACK;
+
+      hi = applyLowBatteryOverlayNibble(x1, y, hi);
+      lo = applyLowBatteryOverlayNibble(x2, y, lo);
+
+      Epaper_Write_Data((hi << 4) | lo);
+    }
+
+    written += rowRead;
   }
   bg.close();
   Epaper_Write_Command(DRF);
@@ -1830,6 +1880,7 @@ void handleRawImagesUpload() {
     }
 
     size_t wrote = galleryUploadFile.write(up.buf, up.currentSize);
+    yield();
     galleryBytesReceived += up.currentSize;
     galleryBytesWritten += wrote;
     if (wrote != up.currentSize) {
@@ -2102,7 +2153,7 @@ void setup() {
     Serial.println("SD card mounted successfully");
     appendDeviceLog("Device boot: SD card mounted");
   }
-  setenv("TZ", "EST5EDT", 1);
+  setenv("TZ", "MST7", 1);
   tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   if (sdMounted) ensureGalleryDir();
