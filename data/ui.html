@@ -2,105 +2,184 @@
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>E-Paper UI</title>
+<title>E-Paper Control</title>
 <style>
-body{font-family:Arial;margin:0;background:#0f172a;color:#e5e7eb}.container{max-width:920px;margin:0 auto;padding:20px}
-.card{background:#111827;padding:16px;border-radius:10px;margin-bottom:14px}h1{text-align:center;color:#f97316}
-label{display:block;margin:8px 0 6px;font-weight:bold}input[type=file],input[type=text],input[type=number]{width:100%;padding:10px;border-radius:6px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
-button{padding:10px 14px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer}.row{display:flex;gap:10px;flex-wrap:wrap}.row button{flex:1}
-.small{font-size:13px;color:#9ca3af}.item{display:flex;justify-content:space-between;gap:8px;align-items:center;background:#0b1220;border:1px solid #1f2937;border-radius:8px;padding:8px;margin-bottom:8px}
-.progress{height:10px;background:#1f2937;border-radius:999px;overflow:hidden}.bar{height:10px;background:#22c55e;width:0%}
+body{font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;margin:0;background:#121212;color:#e0e0e0;line-height:1.6}.container{max-width:600px;margin:0 auto;padding:20px}
+.card{background:#1e1e1e;padding:20px;border-radius:12px;margin-bottom:20px;box-shadow:0 4px 6px rgba(0,0,0,0.3)}h1{text-align:center;color:#ff9800;margin-top:0}h2{color:#ff9800;font-size:1.2em;margin-top:0}
+label{display:block;margin:12px 0 6px;font-weight:600;color:#bbb}input[type=text],input[type=number],select{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#252525;color:#fff;box-sizing:border-box;font-size:16px}
+button{padding:12px 20px;background:#2196f3;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:16px;transition:background 0.2s}button:hover{background:#1976d2}
+.row{display:flex;gap:10px;margin-top:10px}.row button{flex:1}.status-bar{display:flex;justify-content:space-between;font-size:0.9em;color:#888;margin-bottom:10px}
+.btn-danger{background:#f44336} .btn-danger:hover{background:#d32f2f} .btn-success{background:#4caf50} .btn-success:hover{background:#388e3c}
+.small{font-size:0.8em;color:#777;margin-top:4px}
+#library-list{margin-top:10px} .lib-item{display:flex;justify-content:space-between;align-items:center;padding:10px;background:#252525;border-radius:8px;margin-bottom:8px;border:1px solid #333}
 </style>
 </head>
 <body><div class="container">
-<h1>E-Paper</h1>
-<div class="card"><p id="status">Ready.</p><p id="info">Loading status...</p><p id="timer">Loading session timer...</p>
-<div class="row"><button id="extendBtn">+5 minutes</button><button id="shutdownBtn" style="background:#dc2626">Shutdown now</button></div></div>
+<h1>E-Paper Control</h1>
 
 <div class="card">
-<label>Auto-refresh interval (hours)</label><input type="number" id="sleepHours" min="1" max="168" value="24">
-<div class="row" style="margin-top:10px"><button id="saveSleepBtn">Save Interval</button></div>
-<p class="small">OSHA mode enforces max 24h. Photo mode allows 1-168h.</p>
+    <div class="status-bar"><span id="battery">Bat: --%</span><span id="ip">IP: --</span></div>
+    <div id="session-timer" style="text-align:center;font-weight:bold;color:#ff9800;margin-bottom:10px">WiFi active: --:--</div>
+    <div class="row"><button id="extendBtn">Stay Awake +5m</button><button id="shutdownBtn" class="btn-danger">Sleep Now</button></div>
 </div>
 
 <div class="card">
-<h2>Display Mode</h2>
-<label><input type="checkbox" id="oshaEnabled"> OSHA mode</label>
-<label>Google Sheet CSV URL</label><input type="text" id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/.../export?format=csv">
-<div class="row" style="margin-top:10px"><button id="saveOshaBtn">Save Display Mode</button><button id="refreshOshaBtn" style="background:#16a34a">Run OSHA refresh now</button></div>
-<p class="small">Last OSHA: <span id="oshaDays">0</span> days, <span id="oshaPrior">0</span> prior, incident <span id="oshaIncident"></span>, <span id="oshaDate"></span>, <span id="oshaReason"></span>.</p>
+    <h2>Display Settings</h2>
+    <label>Mode</label>
+    <select id="displayMode">
+        <option value="0">Pull from URL</option>
+        <option value="1">Local SD Images</option>
+    </select>
+
+    <div id="url-config">
+        <label>Pull URL</label>
+        <input type="text" id="pullUrl" placeholder="http://example.com/image.bin">
+        <p class="small">Image must be 800x480 raw 4-bit (2 pixels/byte).</p>
+    </div>
+
+    <label>Refresh Interval (hours)</label>
+    <input type="number" id="sleepHours" min="1" max="168" value="24">
+    
+    <div class="row"><button id="saveConfigBtn" class="btn-success">Save & Refresh</button></div>
+</div>
+
+<div class="card" id="sd-card-section">
+    <h2>SD Card Images</h2>
+    <div id="library-list">Loading...</div>
+    <hr style="border:0;border-top:1px solid #333;margin:20px 0">
+    <label>Upload New Image (.bin)</label>
+    <input type="file" id="fileInput" accept=".bin">
+    <button id="uploadBtn" style="margin-top:10px;width:100%">Upload to SD</button>
 </div>
 
 <div class="card">
-<h2>Photo mode upload</h2>
-<label>Image file</label><input type="file" id="fileInput" accept="image/*">
-<label>Optional library name</label><input type="text" id="imageName" placeholder="example-image">
-<button id="uploadBtn" style="margin-top:10px">Upload to Library</button>
-<p id="progressLabel" class="small">Idle</p><div class="progress"><div id="progressBar" class="bar"></div></div>
-</div>
-
-<div class="card">
-<h2>Library</h2>
-<div id="library"></div>
+    <h2>Advanced</h2>
+    <label>Firmware Update (.bin)</label>
+    <input type="file" id="otaInput" accept=".bin">
+    <button id="otaBtn" style="margin-top:10px;width:100%" class="btn-danger">Flash Firmware</button>
+    <p id="otaStatus" class="small"></p>
 </div>
 
 <script>
-const $=id=>document.getElementById(id);const statusEl=$('status'),infoEl=$('info'),timerEl=$('timer');
-const sleepHoursEl=$('sleepHours'),oshaEnabledEl=$('oshaEnabled'),sheetUrlEl=$('sheetUrl');
-const oshaDaysEl=$('oshaDays'),oshaPriorEl=$('oshaPrior'),oshaIncidentEl=$('oshaIncident'),oshaDateEl=$('oshaDate'),oshaReasonEl=$('oshaReason');
+const $=id=>document.getElementById(id);
 let msLeft=0,lastTick=Date.now();
-function setStatus(t){statusEl.textContent=t} function setInfo(t){infoEl.textContent=t}
 
 async function fetchStatus(){
-  try{const d=await (await fetch('/status')).json();
-    setInfo(`SSID: ${d.ssid} | IP: ${d.ip} | Battery: ${d.battery_percent}% (${d.battery_voltage}V) | ${d.battery_state} | Mode: ${d.mode}`);
-    if(document.activeElement!==sleepHoursEl) sleepHoursEl.value=d.sleep_hours||24;
-    if(document.activeElement!==sheetUrlEl) sheetUrlEl.value=d.sheet_url||'';
-    oshaEnabledEl.checked=!!d.osha_enabled; oshaDaysEl.textContent=d.osha_days??0; oshaPriorEl.textContent=d.osha_prior??0;
-    oshaIncidentEl.textContent=d.osha_incident||''; oshaDateEl.textContent=d.osha_date||''; oshaReasonEl.textContent=d.osha_reason||'';
-  }catch(e){setInfo('Unable to load status')}
-}
-async function fetchSession(){try{const d=await (await fetch('/session')).json();msLeft=d.ms_left||0;lastTick=Date.now()}catch(e){}}
-setInterval(()=>{const cur=Math.max(0,msLeft-(Date.now()-lastTick));const s=Math.floor(cur/1000);timerEl.textContent=`Wi-Fi window: ${Math.floor(s/60)}:${String(s%60).padStart(2,'0')} remaining`;},250);
-setInterval(fetchStatus,15000); setInterval(fetchSession,10000);
-
-$('extendBtn').onclick=async()=>{await fetch('/extend?minutes=5',{method:'POST'});fetchSession();};
-$('shutdownBtn').onclick=async()=>{if(confirm('Shutdown now?')) await fetch('/shutdown');};
-$('saveSleepBtn').onclick=async()=>{
-  const h=parseInt(sleepHoursEl.value,10); if(isNaN(h)||h<1||h>168) return alert('Hours must be between 1 and 168');
-  if(oshaEnabledEl.checked&&h>24) return alert('OSHA mode max is 24h');
-  const r=await fetch('/sleepconfig',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hours='+h});
-  alert(r.ok?'Saved':'Failed'); fetchStatus();
-};
-
-$('saveOshaBtn').onclick=async()=>{
-  const body='enabled='+(oshaEnabledEl.checked?1:0)+'&sheet_url='+encodeURIComponent(sheetUrlEl.value.trim());
-  const r=await fetch('/osha/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
-  alert(r.ok?'Saved':'Failed'); fetchStatus();
-};
-$('refreshOshaBtn').onclick=async()=>{const r=await fetch('/osha/refresh',{method:'POST'});alert(r.ok?'Refreshed':'Refresh failed');fetchStatus();};
-
-const EPD_W=800,EPD_H=480,EPD_BYTES=EPD_W*EPD_H/2; const pal=[{code:0x0,r:0,g:0,b:0},{code:0x1,r:255,g:255,b:255},{code:0x2,r:255,g:255,b:0},{code:0x3,r:255,g:0,b:0},{code:0x5,r:0,g:0,b:255},{code:0x6,r:0,g:128,b:0},{code:0x7,r:255,g:255,b:255}];
-const nearest=(r,g,b)=>pal.reduce((a,p)=>{const d=(r-p.r)**2+(g-p.g)**2+(b-p.b)**2;return d<a.d?{d,p}:a},{d:1e12,p:pal[0]}).p;
-function fsDither(img){const d=img.data,w=img.width,h=img.height,cl=v=>Math.max(0,Math.min(255,v));for(let y=0;y<h;y++){for(let x=0;x<w;x++){let i=(y*w+x)*4,or=d[i],og=d[i+1],ob=d[i+2],n=nearest(or,og,ob);d[i]=n.r;d[i+1]=n.g;d[i+2]=n.b;let er=or-n.r,eg=og-n.g,eb=ob-n.b;const sc=(nx,ny,f)=>{if(nx<0||ny<0||nx>=w||ny>=h)return;let j=(ny*w+nx)*4;d[j]=cl(d[j]+er*f);d[j+1]=cl(d[j+1]+eg*f);d[j+2]=cl(d[j+2]+eb*f)};sc(x+1,y,7/16);sc(x-1,y+1,3/16);sc(x,y+1,5/16);sc(x+1,y+1,1/16);}}}
-function convertImage(file,onProg){return new Promise((resolve,reject)=>{const fr=new FileReader();fr.onerror=()=>reject('read');fr.onload=()=>{const im=new Image();im.onload=()=>{onProg(20);const c=document.createElement('canvas');c.width=EPD_W;c.height=EPD_H;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,EPD_W,EPD_H);const portrait=im.height>im.width;if(portrait){x.save();x.translate(EPD_W/2,EPD_H/2);x.rotate(-Math.PI/2);const w=EPD_H,h=EPD_W,s=Math.max(w/im.width,h/im.height);x.drawImage(im,-im.width*s/2,-im.height*s/2,im.width*s,im.height*s);x.restore();}else{const s=Math.max(EPD_W/im.width,EPD_H/im.height);x.drawImage(im,(EPD_W-im.width*s)/2,(EPD_H-im.height*s)/2,im.width*s,im.height*s);}onProg(60);const id=x.getImageData(0,0,EPD_W,EPD_H);fsDither(id);onProg(85);const out=new Uint8Array(EPD_BYTES);let p=0;for(let i=0;i<id.data.length;i+=8){out[p++]=(nearest(id.data[i],id.data[i+1],id.data[i+2]).code<<4)|nearest(id.data[i+4],id.data[i+5],id.data[i+6]).code;}onProg(100);resolve(out);};im.onerror=()=>reject('image');im.src=fr.result;};fr.readAsDataURL(file);});}
-function setProgress(label,pct){$('progressLabel').textContent=label;$('progressBar').style.width=pct+'%';}
-function normalizeUploadName(raw){return (raw||'').replace(/[^A-Za-z0-9_-]/g,'');}
-
-async function uploadLibrary(){const f=$('fileInput').files[0];if(!f) return alert('Pick an image');const requested=$('imageName').value.trim()||f.name.replace(/\.[^.]+$/,'');const targetName=normalizeUploadName(requested);
-  try{setProgress('Converting…',0);const packed=await convertImage(f,p=>setProgress('Converting…',p));
-    setProgress('Uploading…',0);await new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','/images/upload'+(targetName?('?name='+encodeURIComponent(targetName)):''));x.upload.onprogress=e=>{if(e.lengthComputable)setProgress('Uploading…',Math.round((e.loaded/e.total)*100));};x.onload=()=>x.status===200?resolve():reject();x.onerror=reject;const form=new FormData();const uploadName=(targetName||'upload')+'.bin';form.append('file',new Blob([packed],{type:'application/octet-stream'}),uploadName);x.send(form);});
-    setProgress('Done',100);setStatus('Upload complete');await refreshLibrary();
-  }catch(e){setStatus('Upload failed');setProgress('Failed',0);} }
-$('uploadBtn').onclick=uploadLibrary;
-
-async function refreshLibrary(){const res=await fetch('/images/list');const arr=res.ok?await res.json():[];const root=$('library');root.innerHTML='';
-  arr.forEach(name=>{const row=document.createElement('div');row.className='item';const title=document.createElement('div');title.textContent=name;
-    const actions=document.createElement('div');const show=document.createElement('button');show.textContent='Send to display';show.onclick=async()=>{await fetch('/display/show',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)});fetchStatus();};
-    const del=document.createElement('button');del.style.background='#dc2626';del.textContent='Delete';del.onclick=async()=>{if(confirm('Delete '+name+'?')){await fetch('/images/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)});refreshLibrary();}};
-    actions.append(show,del);row.append(title,actions);root.appendChild(row);});
+    try{
+        const d = await (await fetch('/status')).json();
+        $('battery').textContent = `Bat: ${d.battery_percent}% (${d.battery_voltage}V)`;
+        $('ip').textContent = `IP: ${d.ip}`;
+        $('displayMode').value = d.mode;
+        $('pullUrl').value = d.pull_url || '';
+        $('sleepHours').value = d.sleep_hours || 24;
+        toggleModeUI(d.mode);
+    }catch(e){console.error('Status fail',e)}
 }
 
-fetchStatus();fetchSession();refreshLibrary();
+async function fetchSession(){
+    try{
+        const d = await (await fetch('/session')).json();
+        msLeft = d.ms_left || 0;
+        lastTick = Date.now();
+    }catch(e){}
+}
+
+function toggleModeUI(mode){
+    $('url-config').style.display = (mode == 0) ? 'block' : 'none';
+}
+
+$('displayMode').onchange = e => toggleModeUI(e.target.value);
+
+setInterval(()=>{
+    const cur = Math.max(0, msLeft - (Date.now() - lastTick));
+    const s = Math.floor(cur / 1000);
+    $('session-timer').textContent = `WiFi active: ${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+}, 1000);
+
+$('extendBtn').onclick = async () => { await fetch('/extend?minutes=5', {method:'POST'}); fetchSession(); };
+$('shutdownBtn').onclick = async () => { if(confirm('Sleep now?')) await fetch('/shutdown'); };
+
+$('saveConfigBtn').onclick = async () => {
+    const mode = $('displayMode').value;
+    const url = $('pullUrl').value.trim();
+    const hours = $('sleepHours').value;
+
+    await fetch('/config/mode', {method:'POST', body:'mode='+mode, headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    await fetch('/pullurl', {method:'POST', body:'url='+encodeURIComponent(url), headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    await fetch('/sleepconfig', {method:'POST', body:'hours='+hours, headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    
+    alert('Settings saved. Refreshing display...');
+    fetchStatus();
+};
+
+async function refreshLibrary(){
+    const res = await fetch('/images/list');
+    const arr = res.ok ? await res.json() : [];
+    const root = $('library-list');
+    root.innerHTML = '';
+    if(arr.length === 0) root.innerHTML = '<p class="small">No images found on SD card.</p>';
+    arr.forEach(name => {
+        const row = document.createElement('div');
+        row.className = 'lib-item';
+        row.innerHTML = `<span>${name}</span><div>
+            <button onclick="showImage('${name}')" class="btn-success" style="padding:5px 10px;font-size:12px">Show</button>
+            <button onclick="deleteImage('${name}')" class="btn-danger" style="padding:5px 10px;font-size:12px">Del</button>
+        </div>`;
+        root.appendChild(row);
+    });
+}
+
+window.showImage = async (name) => {
+    await fetch('/sd/select', {method:'POST', body:'name='+encodeURIComponent(name), headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    alert('Showing ' + name);
+};
+
+window.deleteImage = async (name) => {
+    if(confirm('Delete ' + name + '?')){
+        await fetch('/images/delete', {method:'POST', body:'name='+encodeURIComponent(name), headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+        refreshLibrary();
+    }
+};
+
+$('uploadBtn').onclick = async () => {
+    const f = $('fileInput').files[0];
+    if(!f) return alert('Pick a .bin file');
+    const formData = new FormData();
+    formData.append('file', f, f.name);
+    try {
+        $('uploadBtn').textContent = 'Uploading...';
+        const res = await fetch('/images/upload?name=' + encodeURIComponent(f.name), {method:'POST', body:formData});
+        if(res.ok) {
+            alert('Uploaded');
+            refreshLibrary();
+        } else alert('Upload failed');
+    } catch(e) { alert('Error: ' + e); }
+    $('uploadBtn').textContent = 'Upload to SD';
+};
+
+$('otaBtn').onclick = async () => {
+    const f = $('otaInput').files[0];
+    if(!f) return alert('Pick a firmware .bin file');
+    if(!confirm('This will flash new firmware and reboot. Proceed?')) return;
+    
+    const formData = new FormData();
+    formData.append('file', f, 'update.bin');
+    
+    try {
+        $('otaBtn').disabled = true;
+        $('otaStatus').textContent = 'Uploading and flashing...';
+        const res = await fetch('/update', {method:'POST', body:formData});
+        const text = await res.text();
+        alert(text);
+        if(res.ok) window.location.reload();
+    } catch(e) { 
+        alert('Error: ' + e);
+        $('otaStatus').textContent = 'Failed';
+    } finally {
+        $('otaBtn').disabled = false;
+    }
+};
+
+fetchStatus(); fetchSession(); refreshLibrary();
 </script>
-</div></body></html>
+</body></html>
