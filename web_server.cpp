@@ -33,8 +33,8 @@ void handleUi() { handleRoot(); }
 void handleUiUpdateMagic() {
   keepAwake();
   if (!sdMounted) { server.send(500, "text/plain", "SD not mounted"); return; }
-  if (downloadFileToSd("https://raw.githubusercontent.com/dsackr/OSHA-7.3eink/main/data/ui.html", "/ui.html")) {
-    server.send(200, "text/plain", "UI Updated. Refresh in 5s.");
+  if (downloadFileToSd("https://raw.githubusercontent.com/dsackr/Osha73/main/data/ui.html", "/ui.html")) {
+    server.send(200, "text/plain", "UI Updated from Osha73. Refresh in 5s.");
   } else {
     server.send(500, "text/plain", "Download failed.");
   }
